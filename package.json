@@ -1,0 +1,22 @@
+{
+  "name": "buoy-telemetry-recovery",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deep-sea buoy telemetry packet ordering recovery service",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "start": "node dist/api/server.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}
