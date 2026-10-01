@@ -31,6 +31,7 @@ export function handleSolve(rawBody: unknown): ApiResponse | ApiError {
       req.countUpper,
       req.minInterval,
       req.maxInterval,
+      req.tempoSwitch,
     );
     return { status: 'ok', data: result };
   } catch (err) {

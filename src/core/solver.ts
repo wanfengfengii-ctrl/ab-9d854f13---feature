@@ -5,6 +5,7 @@ import type {
   PacketInput,
   ConstraintFailureEvidence,
   SolveResult,
+  TempoSwitchInput,
 } from './types.js';
 import { SolveError } from './types.js';
 
@@ -24,6 +25,91 @@ interface Packet {
   symRank: number;
   /** Identifier of the identical-packet symmetry group. */
   symGroup: number;
+}
+
+/**
+ * Sampling-tempo model. Without a switch, switchAt is null and every unit
+ * step uses the old interval. With a switch at absolute count `switchAt`,
+ * the unit step c -> c + 1 uses
+ *   - the old interval when its ENDPOINT count c + 1 < switchAt,
+ *   - the new interval when c + 1 >= switchAt.
+ * An adjacency spanning the switch therefore accumulates the allowed time
+ * difference from BOTH tempos; it must never be judged with one interval
+ * applied to the whole counter gap.
+ */
+interface Tempo {
+  switchAt: number | null;
+  minInterval: number;
+  maxInterval: number;
+  newMinInterval: number;
+  newMaxInterval: number;
+}
+
+function makeTempo(minInterval: number, maxInterval: number, sw?: TempoSwitchInput): Tempo {
+  return {
+    switchAt: sw ? sw.firstNewCount : null,
+    minInterval,
+    maxInterval,
+    newMinInterval: sw ? sw.newMinInterval : minInterval,
+    newMaxInterval: sw ? sw.newMaxInterval : maxInterval,
+  };
+}
+
+/** Last absolute count whose arriving step still uses the OLD tempo. */
+function lastOldEndpoint(tempo: Tempo): number | null {
+  return tempo.switchAt === null ? null : tempo.switchAt - 1;
+}
+
+/**
+ * Split a gap of d unit steps starting at absolute count `a` into old/new
+ * tempo steps. `old` counts steps whose endpoint count is < switchAt.
+ */
+function splitSteps(tempo: Tempo, a: number, d: number): { old: number; new: number } {
+  if (tempo.switchAt === null) return { old: d, new: 0 };
+  const s = lastOldEndpoint(tempo)!;
+  const old = Math.max(0, Math.min(d, s - a));
+  return { old, new: d - old };
+}
+
+/** Inclusive allowed time-difference range of one adjacency edge. */
+function edgeBounds(tempo: Tempo, a: number, d: number): { L: number; U: number } {
+  const { old, new: neu } = splitSteps(tempo, a, d);
+  return {
+    L: old * tempo.minInterval + neu * tempo.newMinInterval,
+    U: old * tempo.maxInterval + neu * tempo.newMaxInterval,
+  };
+}
+
+/**
+ * Extremal (most permissive) edge bounds when the start count is only known
+ * to lie in [aLo, aHi]. The piecewise-linear bounds attain extrema at the
+ * interval endpoints or the switch kink; the result is a sound conservative
+ * range for window tightening across an uncommitted seed count.
+ */
+function edgeExtents(
+  tempo: Tempo,
+  aLo: number,
+  aHi: number,
+  d: number,
+): { Lmin: number; Umax: number } {
+  if (tempo.switchAt === null) {
+    return { Lmin: d * tempo.minInterval, Umax: d * tempo.maxInterval };
+  }
+  const s = lastOldEndpoint(tempo)!;
+  // oldSteps(a) = clamp(0, d, s - a) is piecewise linear with kinks at
+  // a = s - d (edge starts straddling) and a = s (edge fully new); both
+  // bounds are linear inside each region, so extrema occur at region ends.
+  const probes = new Set<number>([aLo, aHi]);
+  if (s - d >= aLo && s - d <= aHi) probes.add(s - d);
+  if (s >= aLo && s <= aHi) probes.add(s);
+  let Lmin = Infinity;
+  let Umax = -Infinity;
+  for (const a of probes) {
+    const b = edgeBounds(tempo, a, d);
+    if (b.L < Lmin) Lmin = b.L;
+    if (b.U > Umax) Umax = b.U;
+  }
+  return { Lmin, Umax };
 }
 
 /** Intrinsic feasibility of an adjacency i -> j: congruent d in [dLo, dHi]. */
@@ -70,6 +156,14 @@ function compareId(a: string | number, b: string | number): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/** Lexicographic comparison of integer time vectors. */
+function compareTimes(a: number[], b: number[]): number {
+  for (let k = 0; k < a.length; k++) {
+    if (a[k] !== b[k]) return a[k] < b[k] ? -1 : 1;
+  }
+  return 0;
+}
+
 /** Minimum |2t - mid2| for an integer t inside [lo, hi]. */
 function minDeviation2(lo: number, hi: number, mid2: number): number {
   const low = Math.floor(mid2 / 2);
@@ -78,33 +172,32 @@ function minDeviation2(lo: number, hi: number, mid2: number): number {
   return Math.abs(2 * t - mid2);
 }
 
+type Win = { lo: number; hi: number };
+
 /**
- * Tighten timestamp windows for a fixed complete order and gap sequence.
- * Forward pass intersects [t_prev + L, t_prev + U]; backward pass intersects
- * [t_next - U, t_next - L]. Nonempty forward windows already imply global
- * feasibility of the difference-constraint chain; the backward pass only
- * shrinks domains for the deviation optimizer. Null = defensively infeasible.
+ * Tighten timestamp windows along a fixed order with explicit per-edge
+ * difference bounds L[k] ≤ t_{k+1} - t_k ≤ U[k]. Forward then backward
+ * intersection; null = infeasible.
  */
-function tightenWindows(
+function tightenChain(
   packets: Packet[],
   order: number[],
-  gaps: number[],
-  minInterval: number,
-  maxInterval: number,
-): { lo: number; hi: number }[] | null {
+  L: number[],
+  U: number[],
+): Win[] | null {
   const n = order.length;
-  const win = new Array<{ lo: number; hi: number }>(n);
+  const win = new Array<Win>(n);
   win[0] = { lo: packets[order[0]].lo, hi: packets[order[0]].hi };
   for (let k = 1; k < n; k++) {
     const p = packets[order[k]];
-    const lo = Math.max(p.lo, win[k - 1].lo + gaps[k - 1] * minInterval);
-    const hi = Math.min(p.hi, win[k - 1].hi + gaps[k - 1] * maxInterval);
+    const lo = Math.max(p.lo, win[k - 1].lo + L[k - 1]);
+    const hi = Math.min(p.hi, win[k - 1].hi + U[k - 1]);
     if (lo > hi) return null;
     win[k] = { lo, hi };
   }
   for (let k = n - 2; k >= 0; k--) {
-    const lo = Math.max(win[k].lo, win[k + 1].lo - gaps[k] * maxInterval);
-    const hi = Math.min(win[k].hi, win[k + 1].hi - gaps[k] * minInterval);
+    const lo = Math.max(win[k].lo, win[k + 1].lo - U[k]);
+    const hi = Math.min(win[k].hi, win[k + 1].hi - L[k]);
     if (lo > hi) return null;
     win[k] = { lo, hi };
   }
@@ -112,32 +205,32 @@ function tightenWindows(
 }
 
 /**
- * Minimize Σ |2 t_k - mid2_k| over integer timestamps subject to
- * t_k ∈ window_k and L_e ≤ t_{e+1} - t_e ≤ U_e, for a FIXED order.
+ * Candidate-value generation + suffix/prefix L1 DP for a fixed chain.
  *
- * Exported for direct differential testing against a full-domain DP.
- *
- * Difference-constraint L1 program on a path. At an integral optimum every
- * variable is pinned — directly or through a chain of tight lower/upper edge
- * constraints — to a pivot: an interval bound or one of the two integers
- * adjacent to its midpoint. Propagating every pivot along every lower/upper
- * pin chain gives O(n · 2^n) candidate values per position (n ≤ 14). A
- * backward shortest-path DP with monotone sliding-window minima computes the
- * optimum; the forward greedy reconstruction returns the lexicographically
- * smallest optimal timestamp vector.
+ * At an integral optimum every variable is pinned — directly or through a
+ * chain of tight lower/upper edge constraints — to a pivot (interval bound
+ * or one of the two integers adjacent to the midpoint). Propagating pivots
+ * along every tight lower/upper chain spans an optimum (chains have at most
+ * 14 positions). Monotone sliding-window minima make both DPs linear in the
+ * candidate counts.
  */
-export function optimalTimes(
+interface ChainL1 {
+  candidates: number[][];
+  dev: (k: number, t: number) => number;
+  /** suffix[k][c] = min deviation on positions k..end given t_k = cand. */
+  suffix: number[][];
+  /** prefix[k][c] = min deviation on positions 0..k given t_k = cand. */
+  prefix: number[][];
+}
+
+function buildChainL1(
   packets: Packet[],
   order: number[],
-  windows: { lo: number; hi: number }[],
-  gaps: number[],
-  minInterval: number,
-  maxInterval: number,
-): { times: number[]; deviation2: number } {
+  windows: Win[],
+  L: number[],
+  U: number[],
+): ChainL1 {
   const n = order.length;
-  const L = gaps.map((d) => d * minInterval);
-  const U = gaps.map((d) => d * maxInterval);
-
   const candSets: Set<number>[] = windows.map(() => new Set<number>());
   const add = (k: number, v: number): void => {
     if (Number.isSafeInteger(v) && v >= windows[k].lo && v <= windows[k].hi) {
@@ -186,7 +279,6 @@ export function optimalTimes(
   const candidates = candSets.map((set) => [...set].sort((a, b) => a - b));
   const dev = (k: number, t: number): number => Math.abs(2 * t - packets[order[k]].mid2);
 
-  // suffix[k][c] = minimal cost on positions k..n-1 with t_k = cand[k][c].
   const suffix: number[][] = new Array(n);
   suffix[n - 1] = candidates[n - 1].map((t) => dev(n - 1, t));
   for (let k = n - 2; k >= 0; k--) {
@@ -213,9 +305,40 @@ export function optimalTimes(
     suffix[k] = cur;
   }
 
+  const prefix: number[][] = new Array(n);
+  prefix[0] = candidates[0].map((t) => dev(0, t));
+  for (let k = 1; k < n; k++) {
+    const before = prefix[k - 1];
+    const prevCands = candidates[k - 1];
+    const cur: number[] = new Array(candidates[k].length);
+    // Feasible t_{k-1} for t is [t - U_e, t - L_e].
+    const deque: number[] = [];
+    let head = 0;
+    let pushed = -1;
+    for (let c = 0; c < candidates[k].length; c++) {
+      const t = candidates[k][c];
+      const low = t - U[k - 1];
+      const high = t - L[k - 1];
+      while (head < deque.length && prevCands[deque[head]] < low) head++;
+      while (pushed + 1 < prevCands.length && prevCands[pushed + 1] <= high) {
+        pushed++;
+        while (deque.length > head && before[deque[deque.length - 1]] >= before[pushed]) deque.pop();
+        deque.push(pushed);
+      }
+      const best = head < deque.length ? before[deque[head]] : Infinity;
+      cur[c] = best + dev(k, t);
+    }
+    prefix[k] = cur;
+  }
+
+  return { candidates, dev, suffix, prefix };
+}
+
+/** Lexicographically smallest optimal timestamp vector for a fixed chain. */
+function reconstructForward(chain: ChainL1, L: number[], U: number[]): number[] {
+  const { candidates, dev, suffix } = chain;
+  const n = candidates.length;
   const globalBest = Math.min(...suffix[0]);
-  // Lexicographically smallest optimal vector: smallest t keeping the
-  // remaining optimum attainable at every position.
   const times = new Array<number>(n);
   let target = globalBest;
   let prevTime = Number.NaN;
@@ -232,7 +355,41 @@ export function optimalTimes(
     target -= dev(k, times[k]);
     prevTime = times[k];
   }
-  return { times, deviation2: globalBest };
+  return times;
+}
+
+/**
+ * Minimize Σ |2 t_k - mid2_k| over integer timestamps subject to
+ * t_k ∈ window_k and L_e ≤ t_{e+1} - t_e ≤ U_e, for a FIXED order.
+ */
+function optimalTimesGeneric(
+  packets: Packet[],
+  order: number[],
+  windows: Win[],
+  L: number[],
+  U: number[],
+): { times: number[]; deviation2: number } {
+  const chain = buildChainL1(packets, order, windows, L, U);
+  if (!Number.isFinite(Math.min(...chain.suffix[0]))) return { times: [], deviation2: Infinity };
+  const times = reconstructForward(chain, L, U);
+  return { times, deviation2: chain.suffix[0][chain.candidates[0].indexOf(times[0])] };
+}
+
+/**
+ * Backward-compatible uniform-tempo entry point, also exercised directly by
+ * the differential tests against a full-domain DP.
+ */
+export function optimalTimes(
+  packets: Packet[],
+  order: number[],
+  windows: { lo: number; hi: number }[],
+  gaps: number[],
+  minInterval: number,
+  maxInterval: number,
+): { times: number[]; deviation2: number } {
+  const L = gaps.map((d) => d * minInterval);
+  const U = gaps.map((d) => d * maxInterval);
+  return optimalTimesGeneric(packets, order, windows, L, U);
 }
 
 interface Move {
@@ -242,6 +399,328 @@ interface Move {
   c0hi: number;
   tLo: number;
   tHi: number;
+}
+
+interface FixedOrderSolution {
+  times: number[];
+  deviation2: number;
+  c0: number;
+}
+
+/**
+ * Exact integer-L1 time recovery for a FIXED order and gap sequence, jointly
+ * choosing the seed absolute count c0 (congruent to the seed remainder) from
+ * [c0lo, c0hi].
+ *
+ * Without a tempo switch edge bounds are independent of c0, so the smallest
+ * admissible c0 is used. With a switch, the x-axis of possible seed counts
+ * is partitioned into O(n) regions: all-old, a single straddling edge i (all
+ * edges before it old, all after it new), and all-new. Inside a straddling
+ * region the two tempo-homogeneous segments optimize independently; they
+ * only couple through the spanning edge, whose bounds are affine in c0 and
+ * are checked exactly (including c0's congruence class).
+ */
+function makeFixedOrderEvaluator(
+  packets: Packet[],
+  modulus: number,
+  tempo: Tempo,
+): (order: number[], gaps: number[], c0lo: number, c0hi: number) => FixedOrderSolution | null {
+  const memo = new Map<string, FixedOrderSolution | null>();
+
+  const smallestCongruent = (lo: number, hi: number, residue: number): number | null => {
+    if (lo > hi) return null;
+    const v = ceilResidue(lo, residue, modulus);
+    return v <= hi ? v : null;
+  };
+
+  /** Smallest c0 congruent to `residue` inside [lo0, hi0] and all clamps. */
+  const congruentInClamps = (
+    lo0: number,
+    hi0: number,
+    residue: number,
+    clamps: { lo?: number; hi?: number }[],
+  ): number | null => {
+    let lo = lo0;
+    let hi = hi0;
+    for (const c of clamps) {
+      if (c.lo !== undefined) lo = Math.max(lo, c.lo);
+      if (c.hi !== undefined) hi = Math.min(hi, c.hi);
+    }
+    return smallestCongruent(lo, hi, residue);
+  };
+
+  const run = (order: number[], gaps: number[], c0lo: number, c0hi: number): FixedOrderSolution | null => {
+    const n = order.length;
+    if (c0lo > c0hi) return null;
+    const residue = modNonNeg(packets[order[0]].remainder, modulus);
+    let gapSum = 0;
+    for (const d of gaps) gapSum += d;
+    const prefixS = new Array<number>(n);
+    prefixS[0] = 0;
+    for (let k = 1; k < n; k++) prefixS[k] = prefixS[k - 1] + gaps[k - 1];
+
+    const candidates: FixedOrderSolution[] = [];
+
+    /** Whole chain under one tempo; c0 is the smallest congruent in range. */
+    const uniform = (useNew: boolean, xLo: number, xHi: number): void => {
+      const x = congruentInClamps(c0lo, c0hi, residue, [{ lo: xLo }, { hi: xHi }]);
+      if (x === null) return;
+      const minI = useNew ? tempo.newMinInterval : tempo.minInterval;
+      const maxI = useNew ? tempo.newMaxInterval : tempo.maxInterval;
+      const L = gaps.map((d) => d * minI);
+      const U = gaps.map((d) => d * maxI);
+      const windows = tightenChain(packets, order, L, U);
+      if (!windows) return;
+      const { times, deviation2 } = optimalTimesGeneric(packets, order, windows, L, U);
+      if (!Number.isFinite(deviation2)) return;
+      candidates.push({ times, deviation2, c0: x });
+    };
+
+    if (tempo.switchAt === null) {
+      // Edge bounds do not depend on c0; keep the smallest admissible count.
+      uniform(false, c0lo, c0hi);
+    } else {
+      const s = lastOldEndpoint(tempo)!;
+      // Fully old region: every observed count is an old-step endpoint,
+      // i.e. the final count x + gapSum <= s.
+      uniform(false, c0lo, s - gapSum);
+      // Fully new region: even the first edge starts at or after s, x >= s.
+      uniform(true, s, c0hi);
+
+      // Between the two uniform regions the switch count s falls either
+      // strictly inside one edge i with o in 1..d_i-1 old steps, or exactly
+      // on an observed packet count. Every integer x is covered by exactly
+      // one case. The two homogeneous segments optimize independently (L1
+      // path DP); they couple only through the spanning edge's synthesized
+      // bounds, linear in o. Among equal-deviation solutions all achieving
+      // pairs are reconstructed and the final sort keeps the lex-min time
+      // vector, breaking ties on the seed count.
+
+      /** Solve the linear interval of o values making delta = w - v feasible,
+       * then return the largest o of the required c0 residue class. */
+      const feasibleO = (delta: number, d: number, K: number): number | null => {
+        let lo = 1;
+        let hi = d - 1;
+        // delta >= d*lNew + o*(lOld - lNew)
+        const aL = tempo.minInterval - tempo.newMinInterval;
+        const bL = delta - d * tempo.newMinInterval;
+        if (aL === 0) {
+          if (bL < 0) return null;
+        } else if (aL > 0) {
+          hi = Math.min(hi, Math.floor(bL / aL));
+        } else {
+          lo = Math.max(lo, Math.ceil(bL / aL));
+        }
+        // delta <= d*uNew + o*(uOld - uNew)
+        const aU = tempo.maxInterval - tempo.newMaxInterval;
+        const bU = delta - d * tempo.newMaxInterval;
+        if (aU === 0) {
+          if (bU > 0) return null;
+        } else if (aU > 0) {
+          lo = Math.max(lo, Math.ceil(bU / aU));
+        } else {
+          hi = Math.min(hi, Math.floor(bU / aU));
+        }
+        if (lo > hi) return null;
+        // x = K - o must be congruent to the seed residue: o ≡ K - residue.
+        const oResidue = modNonNeg(K - residue, modulus);
+        const o = floorResidue(hi, oResidue, modulus);
+        if (o < lo) return null;
+        const x = K - o;
+        if (x < c0lo || x > c0hi) return null;
+        return o;
+      };
+
+      /** Backward lex-min reconstruction of segment 0..anchorPos. */
+      const reconstructBack = (
+        chain: ChainL1,
+        L: number[],
+        U: number[],
+        anchorPos: number,
+        anchorCi: number,
+        costSeg: number,
+      ): number[] => {
+        const out = new Array<number>(anchorPos + 1);
+        out[anchorPos] = chain.candidates[anchorPos][anchorCi];
+        for (let k = anchorPos - 1; k >= 0; k--) {
+          const nextT = out[k + 1];
+          let tailCost = 0;
+          for (let u = k + 1; u <= anchorPos; u++) tailCost += chain.dev(u, out[u]);
+          let chosen = -1;
+          for (let c = 0; c < chain.candidates[k].length; c++) {
+            const t = chain.candidates[k][c];
+            if (nextT - t < L[k] || nextT - t > U[k]) continue;
+            if (chain.prefix[k][c] + tailCost !== costSeg) continue;
+            chosen = c;
+            break;
+          }
+          if (chosen === -1) {
+            throw new SolveError(
+              'NO_CONSISTENT_INTERPRETATION',
+              'internal failure reconstructing pre-switch times',
+            );
+          }
+          out[k] = chain.candidates[k][chosen];
+        }
+        return out;
+      };
+
+      /** Forward lex-min reconstruction of a segment anchored at position 0. */
+      const reconstructFwd = (
+        chain: ChainL1,
+        L: number[],
+        U: number[],
+        anchorCi: number,
+      ): number[] => {
+        const m = chain.candidates.length;
+        const out = new Array<number>(m);
+        out[0] = chain.candidates[0][anchorCi];
+        let target = chain.suffix[0][anchorCi] - chain.dev(0, out[0]);
+        let prev = out[0];
+        for (let k = 1; k < m; k++) {
+          let chosen = -1;
+          for (let c = 0; c < chain.candidates[k].length; c++) {
+            const t = chain.candidates[k][c];
+            if (t - prev < L[k - 1] || t - prev > U[k - 1]) continue;
+            if (chain.suffix[k][c] !== target) continue;
+            chosen = c;
+            break;
+          }
+          if (chosen === -1) {
+            throw new SolveError(
+              'NO_CONSISTENT_INTERPRETATION',
+              'internal failure reconstructing post-switch times',
+            );
+          }
+          out[k] = chain.candidates[k][chosen];
+          target -= chain.dev(k, out[k]);
+          prev = out[k];
+        }
+        return out;
+      };
+
+      // ---- Switch strictly inside an edge ----------------------------------
+      for (let i = 0; i < n - 1; i++) {
+        if (gaps[i] < 2) continue; // no interior old-step count possible
+        const d = gaps[i];
+        const K = s - prefixS[i];
+
+        const ordA = order.slice(0, i + 1);
+        const gapsA = gaps.slice(0, i);
+        const LA = gapsA.map((gg) => gg * tempo.minInterval);
+        const UA = gapsA.map((gg) => gg * tempo.maxInterval);
+        const winA = tightenChain(packets, ordA, LA, UA);
+        if (!winA) continue;
+        const chainA = buildChainL1(packets, ordA, winA, LA, UA);
+
+        const ordB = order.slice(i + 1);
+        const gapsB = gaps.slice(i + 1);
+        const LB = gapsB.map((gg) => gg * tempo.newMinInterval);
+        const UB = gapsB.map((gg) => gg * tempo.newMaxInterval);
+        const winB = tightenChain(packets, ordB, LB, UB);
+        if (!winB) continue;
+        const chainB = buildChainL1(packets, ordB, winB, LB, UB);
+
+        type Pair = { vi: number; wi: number; o: number; cost: number };
+        const pairs: Pair[] = [];
+        let caseMin = Infinity;
+        for (let vi = 0; vi < chainA.candidates[i].length; vi++) {
+          const costA = chainA.prefix[i][vi];
+          if (!Number.isFinite(costA)) continue;
+          const v = chainA.candidates[i][vi];
+          for (let wi = 0; wi < chainB.candidates[0].length; wi++) {
+            const costB = chainB.suffix[0][wi];
+            if (!Number.isFinite(costB)) continue;
+            const w = chainB.candidates[0][wi];
+            const o = feasibleO(w - v, d, K);
+            if (o === null) continue;
+            const cost = costA + costB;
+            if (cost <= caseMin) {
+              if (cost < caseMin) pairs.length = 0;
+              caseMin = cost;
+              pairs.push({ vi, wi, o, cost });
+            }
+          }
+        }
+        for (const pr of pairs) {
+          const timesA = reconstructBack(chainA, LA, UA, i, pr.vi, chainA.prefix[i][pr.vi]);
+          const timesB = reconstructFwd(chainB, LB, UB, pr.wi);
+          candidates.push({
+            times: [...timesA, ...timesB],
+            deviation2: pr.cost,
+            c0: K - pr.o,
+          });
+        }
+      }
+
+      // ---- Switch lands exactly on an observed packet count ----------------
+      for (let r = 1; r < n; r++) {
+        const x = s - prefixS[r];
+        if (x < c0lo || x > c0hi || modNonNeg(x, modulus) !== residue) continue;
+
+        const ordA = order.slice(0, r + 1);
+        const gapsA = gaps.slice(0, r);
+        const LA = gapsA.map((gg) => gg * tempo.minInterval);
+        const UA = gapsA.map((gg) => gg * tempo.maxInterval);
+        const winA = tightenChain(packets, ordA, LA, UA);
+        if (!winA) continue;
+        const chainA = buildChainL1(packets, ordA, winA, LA, UA);
+
+        const ordB = order.slice(r);
+        const gapsB = gaps.slice(r);
+        const LB = gapsB.map((gg) => gg * tempo.newMinInterval);
+        const UB = gapsB.map((gg) => gg * tempo.newMaxInterval);
+        const winB = tightenChain(packets, ordB, LB, UB);
+        if (!winB) continue;
+        const chainB = buildChainL1(packets, ordB, winB, LB, UB);
+
+        const wIndex = new Map<number, number>();
+        chainB.candidates[0].forEach((v, idx) => wIndex.set(v, idx));
+
+        type Anch = { vi: number; wi: number; cost: number };
+        const anchors: Anch[] = [];
+        let caseMin = Infinity;
+        for (let vi = 0; vi < chainA.candidates[r].length; vi++) {
+          const costA = chainA.prefix[r][vi];
+          if (!Number.isFinite(costA)) continue;
+          const v = chainA.candidates[r][vi];
+          const wi = wIndex.get(v);
+          if (wi === undefined) continue;
+          const costB = chainB.suffix[0][wi];
+          if (!Number.isFinite(costB)) continue;
+          const cost = costA + costB - chainA.dev(r, v);
+          if (cost <= caseMin) {
+            if (cost < caseMin) anchors.length = 0;
+            caseMin = cost;
+            anchors.push({ vi, wi, cost });
+          }
+        }
+        for (const an of anchors) {
+          const timesA = reconstructBack(chainA, LA, UA, r, an.vi, chainA.prefix[r][an.vi]);
+          const timesB = reconstructFwd(chainB, LB, UB, an.wi).slice(1);
+          candidates.push({
+            times: [...timesA, ...timesB],
+            deviation2: an.cost,
+            c0: x,
+          });
+        }
+      }
+    }
+    if (candidates.length === 0) return null;
+    candidates.sort(
+      (a, b) => a.deviation2 - b.deviation2 || compareTimes(a.times, b.times) || a.c0 - b.c0,
+    );
+    return candidates[0];
+  };
+
+  return (order: number[], gaps: number[], c0lo: number, c0hi: number): FixedOrderSolution | null => {
+    const key = `${order.join(',')}|${gaps.join(',')}|${c0lo}|${c0hi}`;
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+    const result = run(order, gaps, c0lo, c0hi);
+    memo.set(key, result);
+    return result;
+  };
 }
 
 /**
@@ -272,7 +751,15 @@ export function solve(
   countUpper: number,
   minInterval: number,
   maxInterval: number,
+  tempoSwitchInput?: TempoSwitchInput,
 ): SolveResult {
+  const tempo = makeTempo(minInterval, maxInterval, tempoSwitchInput);
+  // Extremal per-step intervals across both tempos: used only for SOUND
+  // intrinsic pruning (a feasible move must survive the most permissive
+  // per-step bound); exact edge bounds are always checked per move.
+  const stepMinLoose = Math.min(tempo.minInterval, tempo.newMinInterval);
+  const stepMaxLoose = Math.max(tempo.maxInterval, tempo.newMaxInterval);
+
   const n = inputs.length;
   const W = countUpper - countLower;
 
@@ -311,8 +798,9 @@ export function solve(
   }));
 
   // Intrinsic adjacency feasibility = congruent-gap RANGE per ordered pair.
-  // Time: L_d ≤ t_j - t_i ≤ U_d with t_i∈I_i, t_j∈I_j:
-  //   d ≥ ceil((lo_j - hi_i)/maxInterval), d ≤ floor((hi_j - lo_i)/minInterval).
+  // Time bounds use the loosest per-step interval of the two tempos so that
+  // tempo-dependent pruning can never discard a feasible extension; exact
+  // split-aware bounds are applied per move below.
   // Counts: c_i, c_j = c_i + d both inside the search window:
   //   base_j - top_i ≤ d ≤ top_j - base_i.
   const pair: PairFeas[][] = packets.map((pi) =>
@@ -321,12 +809,12 @@ export function solve(
       const d0 = pi.index === pj.index ? Infinity : delta === 0 ? modulus : delta;
       const dLo = Math.max(
         d0,
-        Math.ceil((pj.lo - pi.hi) / maxInterval),
+        Math.ceil((pj.lo - pi.hi) / stepMaxLoose),
         pj.baseCount - pi.topCount,
       );
       const dHi = Math.min(
         W,
-        Math.floor((pj.hi - pi.lo) / minInterval),
+        Math.floor((pj.hi - pi.lo) / stepMinLoose),
         pj.topCount - pi.baseCount,
       );
       return { delta, dLo, dHi };
@@ -381,6 +869,8 @@ export function solve(
     ...seedOrder.map((p) => cont[full ^ (1 << p.index)][p.index]),
   );
 
+  const evaluateFixedOrder = makeFixedOrderEvaluator(packets, modulus, tempo);
+
   // Per-position arrays shared by the recursive searches.
   const orderArr = new Array<number>(n);
   const tLoArr = new Array<number>(n);
@@ -424,6 +914,8 @@ export function solve(
     mask: number,
   ): Move[] => {
     const slotsAfter = n - 1 - depth;
+    const aLo = S + c0lo;
+    const aHi = S + c0hi;
     const moves: Move[] = [];
     for (let j = 0; j < n; j++) {
       if (mask & (1 << j)) continue;
@@ -433,13 +925,13 @@ export function solve(
       const dLo = Math.max(
         pf.dLo,
         pj.baseCount - S - c0hi,
-        Math.ceil((pj.lo - tHi) / maxInterval),
+        Math.ceil((pj.lo - tHi) / stepMaxLoose),
       );
       const dHi0 = Math.min(
         pf.dHi,
         pj.topCount - S - c0lo,
         countUpper - slotsAfter - S - c0lo,
-        Math.floor((pj.hi - tLo) / minInterval),
+        Math.floor((pj.hi - tLo) / stepMinLoose),
       );
       if (dLo > dHi0) continue;
       const dMin = ceilResidue(dLo, pf.delta, modulus);
@@ -448,16 +940,20 @@ export function solve(
       const consider = (d: number): Move | null => {
         const njLo = Math.max(c0lo, pj.baseCount - S - d);
         const njHi = Math.min(c0hi, pj.topCount - S - d, countUpper - slotsAfter - S - d);
-        const ntLo = Math.max(pj.lo, tLo + d * minInterval);
-        const ntHi = Math.min(pj.hi, tHi + d * maxInterval);
+        // Split-aware conservative edge bounds over the remaining start-count
+        // window: sound for existence of some seed count, exactness is
+        // recovered by the fixed-order evaluator at leaves.
+        const { Lmin, Umax } = edgeExtents(tempo, aLo, aHi, d);
+        const ntLo = Math.max(pj.lo, tLo + Lmin);
+        const ntHi = Math.min(pj.hi, tHi + Umax);
         if (njLo > njHi || ntLo > ntHi) return null;
         return { j, d, c0lo: njLo, c0hi: njHi, tLo: ntLo, tHi: ntHi };
       };
 
       for (let d = dMin; d <= dHi0; d += modulus) {
-        // The rising time lower bound is monotone in d; once it passes j's
-        // interval no larger gap can work.
-        if (d * minInterval > pj.hi - tLo) break;
+        // The rising time lower bound cannot be loosened by larger gaps
+        // beyond the loosest per-step tempo; stop once it clears j's hi.
+        if (d * stepMinLoose > pj.hi - tLo) break;
         const mv = consider(d);
         if (mv) moves.push(mv);
       }
@@ -480,10 +976,50 @@ export function solve(
     }
   };
 
+  /** Cheap leaf time-feasibility used by the primary-optimal oracle and
+   * phase A. Without a tempo switch the monotone forward tightening already
+   * certifies every reached leaf; with a switch the exact fixed-order
+   * evaluator must check some admissible seed count. */
+  const leafFeasible = (c0lo: number, c0hi: number): boolean =>
+    tempo.switchAt === null || evaluateFixedOrder(orderArr.slice(), gapsArr.slice(), c0lo, c0hi) !== null;
+
+  /** Exact leaf deviation (and optimal times/seed count) for phases B/C. */
+  const leafSolution = (c0lo: number, c0hi: number): FixedOrderSolution | null =>
+    tempo.switchAt === null
+      ? (() => {
+          const order = orderArr.slice();
+          const gaps = gapsArr.slice();
+          const windows = tightenChain(
+            packets,
+            order,
+            gaps.map((d) => d * tempo.minInterval),
+            gaps.map((d) => d * tempo.maxInterval),
+          );
+          if (!windows) return null;
+          const { times, deviation2 } = optimalTimesGeneric(
+            packets,
+            order,
+            windows,
+            gaps.map((d) => d * tempo.minInterval),
+            gaps.map((d) => d * tempo.maxInterval),
+          );
+          return Number.isFinite(deviation2) ? { times, deviation2, c0: c0lo } : null;
+        })()
+      : evaluateFixedOrder(orderArr.slice(), gapsArr.slice(), c0lo, c0hi);
+
   // ------------------------------------------------------------------ Phase A
   // Minimum total counter gap. A state memo caches the best completion gap
-  // sum (Infinity = dead); state = (used set, last packet, fixed prefix gap
-  // sum, tightened c0 and last-timestamp windows).
+  // sum (Infinity = dead). Without a tempo switch the state is Markovian in
+  // (used set, last packet, fixed gap sum, tightened c0/last-time windows);
+  // with a switch, leaf time feasibility also depends on the complete
+  // prefix (every edge's tempo split), so the full prefix joins the key.
+  const prefixSignature = (depth: number): string => {
+    let s = '';
+    for (let k = 0; k < depth; k++) {
+      s += `>${orderArr[k]}:${k > 0 ? gapsArr[k - 1] : 0}:${tLoArr[k]},${tHiArr[k]}`;
+    }
+    return s;
+  };
   const memoA = new Map<string, number>();
   let bestA = Infinity;
   let stopA = false;
@@ -491,6 +1027,9 @@ export function solve(
   const dfsA = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): number => {
     if (stopA) return Infinity;
     if (depth === n) {
+      // A tempo switch makes time feasibility depend on the actual seed
+      // count; verify the complete chain before accepting the leaf.
+      if (!leafFeasible(c0lo, c0hi)) return Infinity;
       if (S < bestA) bestA = S;
       if (bestA === globalPrimaryLB) stopA = true;
       return S;
@@ -502,7 +1041,7 @@ export function solve(
     // deepest non-extendable state for failure evidence.
     if (Number.isFinite(bestA) && S + cont[remaining][last] >= bestA) return Infinity;
 
-    const key = `A|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
+    const key = `A|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}|${tempo.switchAt === null ? '' : prefixSignature(depth)}`;
     const cached = memoA.get(key);
     if (cached !== undefined) return cached;
 
@@ -544,14 +1083,11 @@ export function solve(
     dfsA(1, seed.index, 0, seed.baseCount, c0hi0, seed.lo, seed.hi);
   }
   if (bestA === Infinity) {
-    throw buildFailureEvidence(packets, pair, bestDead, modulus, countUpper, minInterval, maxInterval);
+    throw buildFailureEvidence(packets, pair, bestDead, modulus, countUpper, tempo);
   }
   const Pstar = bestA;
 
   // ------------------------------------------------------------- Phase B/C key
-  // Deviation-relevant state also records the per-position tightened windows
-  // AND interval identities (midpoint sequence), since converging paths with
-  // different packet types at prefix positions are not interchangeable.
   /** Exact state signature for the deviation/lex phases: full prefix packet
    * sequence, its gaps and every position's tightened window. Paths sharing
    * this signature have identical prefix deviation and an identical frontier,
@@ -566,14 +1102,8 @@ export function solve(
 
   /**
    * Exact primary-optimal-chain oracle. Returns true exactly when a
-   * completion of the CURRENT state reaches total gap Pstar. Unlike the
-   * intrinsic Held-Karp bound, this accounts for time/count feasibility, so
-   * it is the correct filter for the deviation and lexicographic phases.
-   *
-   * The state is Markovian in (used mask, last packet, fixed gap sum S,
-   * tightened c0 window and last timestamp window): difference constraints on
-   * an ordered chain mean earlier prefix positions influence the future only
-   * through the last packet's tightened window.
+   * completion of the CURRENT state reaches total gap Pstar AND admits
+   * integer timestamps (with some seed count).
    */
   const memoOpt = new Map<string, boolean>();
   const optimalFromState = (
@@ -586,8 +1116,8 @@ export function solve(
     tHi: number,
     mask: number,
   ): boolean => {
-    if (depth === n) return S === Pstar;
-    const key = `O|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
+    if (depth === n) return S === Pstar && leafFeasible(c0lo, c0hi);
+    const key = `O|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}|${tempo.switchAt === null ? '' : prefixSignature(depth)}`;
     const cached = memoOpt.get(key);
     if (cached !== undefined) return cached;
 
@@ -598,6 +1128,16 @@ export function solve(
       // Necessary bound for reaching Pstar; exact feasibility checked below.
       if (S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] > Pstar) continue;
       used[mv.j] = 1;
+      // The leaf time-feasibility check below reconstructs from these
+      // arrays, so record the explored move and restore it afterwards.
+      const savedJ = orderArr[depth];
+      const savedD = gapsArr[depth - 1];
+      const savedLo = tLoArr[depth];
+      const savedHi = tHiArr[depth];
+      orderArr[depth] = mv.j;
+      gapsArr[depth - 1] = mv.d;
+      tLoArr[depth] = mv.tLo;
+      tHiArr[depth] = mv.tHi;
       const v = optimalFromState(
         depth + 1,
         mv.j,
@@ -608,6 +1148,10 @@ export function solve(
         mv.tHi,
         mask | (1 << mv.j),
       );
+      orderArr[depth] = savedJ;
+      gapsArr[depth - 1] = savedD;
+      tLoArr[depth] = savedLo;
+      tHiArr[depth] = savedHi;
       used[mv.j] = 0;
       if (v) {
         ok = true;
@@ -633,7 +1177,17 @@ export function solve(
     const all = enumerateMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask);
     return all.filter((mv) => {
       if (S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] > Pstar) return false;
-      return optimalFromState(
+      // Record the probed move so the prefix-dependent oracle key and leaf
+      // reconstruction see slot `depth` during this standalone probe.
+      const savedJ = orderArr[depth];
+      const savedD = gapsArr[depth - 1];
+      const savedLo = tLoArr[depth];
+      const savedHi = tHiArr[depth];
+      orderArr[depth] = mv.j;
+      gapsArr[depth - 1] = mv.d;
+      tLoArr[depth] = mv.tLo;
+      tHiArr[depth] = mv.tHi;
+      const ok = optimalFromState(
         depth + 1,
         mv.j,
         S + mv.d,
@@ -643,6 +1197,11 @@ export function solve(
         mv.tHi,
         mask | (1 << mv.j),
       );
+      orderArr[depth] = savedJ;
+      gapsArr[depth - 1] = savedD;
+      tLoArr[depth] = savedLo;
+      tHiArr[depth] = savedHi;
+      return ok;
     });
   };
 
@@ -651,16 +1210,16 @@ export function solve(
     const seed = packets[seedIndex];
     const c0hi0 = Math.min(seed.topCount, countUpper - n + 1);
     if (seed.baseCount > c0hi0) return false;
+    // Initialize position 0 so prefix-dependent leaf checks/memo keys see
+    // the seed even during this standalone oracle call.
+    orderArr[0] = seedIndex;
+    tLoArr[0] = seed.lo;
+    tHiArr[0] = seed.hi;
     return optimalFromState(1, seedIndex, 0, seed.baseCount, c0hi0, seed.lo, seed.hi, 1 << seedIndex);
   };
 
-  const leafDeviation = (): number => {
-    const order = orderArr.slice();
-    const gaps = gapsArr.slice();
-    const windows = tightenWindows(packets, order, gaps, minInterval, maxInterval);
-    if (windows === null) return Infinity;
-    return optimalTimes(packets, order, windows, gaps, minInterval, maxInterval).deviation2;
-  };
+  const leafDeviation = (c0lo: number, c0hi: number): number =>
+    leafSolution(c0lo, c0hi)?.deviation2 ?? Infinity;
 
   // ------------------------------------------------------------------ Phase B
   // Minimum total deviation2 over primary-optimal chains.
@@ -678,7 +1237,7 @@ export function solve(
 
   const dfsB = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): number => {
     if (depth === n) {
-      const v = leafDeviation();
+      const v = leafDeviation(c0lo, c0hi);
       if (v < bestB) bestB = v;
       return v;
     }
@@ -738,7 +1297,7 @@ export function solve(
 
   const dfsCfeasible = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): boolean => {
     if (depth === n) {
-      return leafDeviation() === Dstar;
+      return leafDeviation(c0lo, c0hi) === Dstar;
     }
     const mask = usedMask();
     const key = stateKeyBC(depth, last, S, c0lo, c0hi, tLo, tHi);
@@ -754,7 +1313,7 @@ export function solve(
       tLoArr[depth] = mv.tLo;
       tHiArr[depth] = mv.tHi;
       ok = dfsCfeasible(depth + 1, mv.j, S + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi);
-      used[mv.j] =0;
+      used[mv.j] = 0;
       if (ok) break;
     }
     memoC.set(key, ok);
@@ -772,8 +1331,11 @@ export function solve(
   let curMask = 0;
 
   /** Reproduce the forward-tightened windows of the fixed prefix so the
-   * oracle's memoization keys and leaf tightening see a consistent state. */
+   * oracle's memoization keys and leaf evaluation see a consistent state.
+   * The seed-count window is [curC0lo, curC0hi]; each edge's start-count
+   * window is shifted by the sum of the already fixed prefix gaps. */
   const replayPrefixWindows = (): void => {
+    let prefixGap = 0;
     for (let k = 0; k < chosen.length; k++) {
       const p = packets[chosen[k]];
       if (k === 0) {
@@ -781,8 +1343,10 @@ export function solve(
         tHiArr[0] = p.hi;
       } else {
         const d = fixedGaps[k - 1];
-        tLoArr[k] = Math.max(p.lo, tLoArr[k - 1] + d * minInterval);
-        tHiArr[k] = Math.min(p.hi, tHiArr[k - 1] + d * maxInterval);
+        const { Lmin, Umax } = edgeExtents(tempo, curC0lo + prefixGap, curC0hi + prefixGap, d);
+        tLoArr[k] = Math.max(p.lo, tLoArr[k - 1] + Lmin);
+        tHiArr[k] = Math.min(p.hi, tHiArr[k - 1] + Umax);
+        prefixGap += d;
       }
       orderArr[k] = chosen[k];
       if (k > 0) gapsArr[k - 1] = fixedGaps[k - 1];
@@ -857,21 +1421,13 @@ export function solve(
     curMask |= 1 << picked.j;
   }
 
-  // Assemble the certified solution: smallest admissible c0, optimal times.
+  // Assemble the certified solution: exact seed count and optimal times.
   const finalOrder = chosen.slice();
   const finalGaps = fixedGaps.slice();
-  const windows = tightenWindows(packets, finalOrder, finalGaps, minInterval, maxInterval);
-  if (!windows) {
+  const sol = evaluateFixedOrder(finalOrder, finalGaps, curC0lo, curC0hi);
+  if (!sol) {
     throw new SolveError('NO_CONSISTENT_INTERPRETATION', 'internal failure tightening final windows');
   }
-  const { times, deviation2: dev2 } = optimalTimes(
-    packets,
-    finalOrder,
-    windows,
-    finalGaps,
-    minInterval,
-    maxInterval,
-  );
   let gapSum = 0;
   for (const d of finalGaps) gapSum += d;
 
@@ -879,15 +1435,14 @@ export function solve(
     packets,
     {
       gapSum,
-      deviation2: dev2,
-      times,
+      deviation2: sol.deviation2,
+      times: sol.times,
       order: finalOrder,
-      c0: curC0lo,
+      c0: sol.c0,
       gaps: finalGaps,
     },
     modulus,
-    minInterval,
-    maxInterval,
+    tempo,
   );
 }
 
@@ -895,8 +1450,7 @@ function buildResult(
   packets: Packet[],
   cand: { gapSum: number; deviation2: number; times: number[]; order: number[]; c0: number; gaps: number[] },
   modulus: number,
-  minInterval: number,
-  maxInterval: number,
+  tempo: Tempo,
 ): SolveResult {
   const n = cand.order.length;
   const order = cand.order.map((ix) => packets[ix].id);
@@ -923,6 +1477,9 @@ function buildResult(
       }
       const tGap = cand.times[k] - cand.times[k - 1];
       const prevP = packets[cand.order[k - 1]];
+      const split = splitSteps(tempo, prevCount, d);
+      const allowedMin = split.old * tempo.minInterval + split.new * tempo.newMinInterval;
+      const allowedMax = split.old * tempo.maxInterval + split.new * tempo.newMaxInterval;
       adjacency.push({
         index: k - 1,
         fromId: prevP.id,
@@ -930,10 +1487,13 @@ function buildResult(
         fromCount: prevCount,
         toCount: count,
         countGap: d,
+        oldSteps: split.old,
+        newSteps: split.new,
+        tempoSwitchAt: tempo.switchAt,
         fromTime: cand.times[k - 1],
         toTime: cand.times[k],
         timeGap: tGap,
-        allowedTimeGap: { min: d * minInterval, max: d * maxInterval },
+        allowedTimeGap: { min: allowedMin, max: allowedMax },
         missingBetween: d - 1,
         congruence: { remainder: p.remainder, modulus },
         absoluteCountCongruent: modNonNeg(count, modulus) === p.remainder,
@@ -942,8 +1502,8 @@ function buildResult(
           to: { lower: p.lo, upper: p.hi },
         },
         satisfied:
-          tGap >= d * minInterval &&
-          tGap <= d * maxInterval &&
+          tGap >= allowedMin &&
+          tGap <= allowedMax &&
           cand.times[k - 1] >= prevP.lo &&
           cand.times[k - 1] <= prevP.hi &&
           cand.times[k] >= p.lo &&
@@ -971,8 +1531,7 @@ function buildFailureEvidence(
   bestDead: DeadState | null,
   modulus: number,
   countUpper: number,
-  minInterval: number,
-  maxInterval: number,
+  tempo: Tempo,
 ): SolveError {
   const make = (evidence: ConstraintFailureEvidence): SolveError =>
     new SolveError(
@@ -996,15 +1555,18 @@ function buildFailureEvidence(
   const partialOrder = placed.map((ix) => packets[ix].id);
   const usedNow = new Set(placed);
   const slotsAfter = n - 1 - depth;
+  const aLo = S + c0lo;
+  const aHi = S + c0hi;
 
   // Reproduce the canonical successor scan at the deepest dead end. For each
   // unused successor derive the feasible counter-gap range implied by each
   // constraint class independently:
-  //   time:  [Tlo, Thi] from the tightened timestamp windows
+  //   time:  [Tlo, Thi] from the tightened timestamp windows (loosest tempo)
   //   count: [Clo, Chi] from the c0 window and remaining absolute slots
-  // plus the intrinsic ceiling pair.dHi (raw pair intervals + search window)
-  // and the congruence residue. Their intersection is empty at a dead end;
-  // the first blocker in canonical order (cause, gap, id) is reported.
+  // plus the intrinsic ceiling pair.dHi and the congruence residue. Their
+  // intersection is empty at a dead end; the first blocker in canonical
+  // order (cause, gap, id) is reported, including the absolute-count range
+  // and an old/new tempo step decomposition.
   type Blocker = {
     j: number;
     cause: 'TIME_GAP' | 'COUNT_WINDOW' | 'CONGRUENCE';
@@ -1014,15 +1576,18 @@ function buildFailureEvidence(
     countRange: { min: number; max: number };
     intrinsicCeiling: number;
     achievable: { min: number; max: number };
+    representative: {
+      fromLo: number;
+      fromHi: number;
+      from: number;
+      allowed: { min: number; max: number };
+      oldSteps: number;
+      newSteps: number;
+    } | null;
+    /** Attainable from-count range [aLo,aHi] for the whole successor set. */
+    fromRange: { min: number; max: number };
   };
   const blockers: Blocker[] = [];
-
-  /** Smallest value >= lo congruent to `delta` and <= hi, else Infinity. */
-  const snap = (lo: number, hi: number, delta: number): number => {
-    if (lo > hi) return Infinity;
-    const v = ceilResidue(lo, delta, modulus);
-    return v <= hi ? v : Infinity;
-  };
 
   for (let j = 0; j < n; j++) {
     if (usedNow.has(j)) continue;
@@ -1030,38 +1595,120 @@ function buildFailureEvidence(
     const pf = pair[last][j];
     const d0 = pf.delta === 0 ? modulus : pf.delta;
 
-    const Tlo = Math.ceil((pj.lo - tHi) / maxInterval);
-    const Thi = Math.floor((pj.hi - tLo) / minInterval);
-    const Clo = pj.baseCount - S - c0hi;
-    const Chi = Math.min(pj.topCount - S - c0lo, countUpper - slotsAfter - S - c0lo);
-    const loAll = Math.max(d0, Tlo, Clo);
-    const hiAll = Math.min(pf.dHi, Thi, Chi);
+    // --- Count-only admissibility (independent of the tempo model) --------
+    const Clo = Math.max(d0, pj.baseCount - S - c0hi);
+    const Chi = Math.min(
+      pf.dHi,
+      pj.topCount - S - c0lo,
+      countUpper - slotsAfter - S - c0lo,
+    );
+    const dCount =
+      Clo <= Chi
+        ? (() => {
+            const d = ceilResidue(Clo, pf.delta, modulus);
+            return d <= Chi ? d : Infinity;
+          })()
+        : Infinity;
 
-    const snapOrInf = (lo: number, hi: number): number => {
-      if (lo > hi) return Infinity;
-      const d = ceilResidue(lo, pf.delta, modulus);
-      return d <= hi ? d : Infinity;
-    };
-    const dTime = snapOrInf(Math.max(d0, Tlo), Thi);
-    const dCount = snapOrInf(Math.max(d0, Clo), Chi);
-    const dBoth = snapOrInf(loAll, hiAll);
+    // --- Tempo-exact time feasibility over attainable congruent starts ----
+    // The edge start count a is congruent to the last packet's remainder and
+    // lies in [aLo, aHi]; synthesized edge bounds are probed exactly for
+    // each congruent gap. This error path is visited at most once per
+    // failing request, and the gap sequence is bounded by the <= 1e6 wide
+    // search window, so a direct scan stays exact and simple.
+    const aResidue = modNonNeg(packets[last].remainder, modulus);
+    const achMin = pj.lo - tHi;
+    const achMax = pj.hi - tLo;
+
+    const fromWindowFor = (d: number): { lo: number; hi: number } => ({
+      lo: Math.max(aLo, pj.baseCount - d),
+      hi: Math.min(aHi, pj.topCount - d, countUpper - slotsAfter - d),
+    });
+
+    let dTime = Infinity;
+    let dTimeHi = -Infinity;
+    for (let d = ceilResidue(d0, pf.delta, modulus); d <= pf.dHi; d += modulus) {
+      const { lo, hi } = fromWindowFor(d);
+      if (lo > hi) continue;
+      const aFirst = ceilResidue(lo, aResidue, modulus);
+      if (aFirst > hi) continue;
+      const aLast = floorResidue(hi, aResidue, modulus);
+      const probes = new Set<number>([aFirst, aLast]);
+      if (tempo.switchAt !== null) {
+        // The only non-linearity is the switch kink; probe the congruent
+        // starts bracketing it within this edge's start-count window.
+        const s = lastOldEndpoint(tempo)!;
+        const k1 = floorResidue(Math.min(hi, s), aResidue, modulus);
+        const k2 = ceilResidue(Math.max(lo, s - d + 1), aResidue, modulus);
+        if (k1 >= lo) probes.add(k1);
+        if (k2 <= hi) probes.add(k2);
+      }
+      let ok = false;
+      for (const a of probes) {
+        if (a < lo || a > hi) continue;
+        const b = edgeBounds(tempo, a, d);
+        if (b.L <= achMax && b.U >= achMin) {
+          ok = true;
+          break;
+        }
+      }
+      if (ok) {
+        if (dTime === Infinity) dTime = d;
+        dTimeHi = d;
+      }
+    }
+
+    let dBoth = Infinity;
+    if (dCount !== Infinity && dTime !== Infinity) {
+      const loB = Math.max(Clo, dTime);
+      const hiB = Math.min(Chi, dTimeHi);
+      if (loB <= hiB) {
+        const d = ceilResidue(loB, pf.delta, modulus);
+        if (d <= hiB) dBoth = d;
+      }
+    }
 
     let cause: Blocker['cause'];
     let dStar: number;
     if (dBoth !== Infinity) continue; // extendable; cannot occur at a dead end
     if (dCount !== Infinity) {
-      // The smallest gap satisfying congruence + the count window exists;
-      // the extension attempt at it fails on the time-difference range.
+      // The count window admits a congruent gap but the tempo envelope does
+      // not: a missing-packet / tempo-switch TIME conflict.
       cause = 'TIME_GAP';
       dStar = dCount;
     } else if (dTime !== Infinity) {
-      // Timing admits a congruent gap but the absolute-count window does not.
       cause = 'COUNT_WINDOW';
       dStar = dTime;
     } else {
-      // Neither range alone contains a congruent value.
-      cause = Tlo > Thi ? 'TIME_GAP' : 'CONGRUENCE';
+      cause = 'CONGRUENCE';
       dStar = Infinity;
+    }
+
+    let representative: Blocker['representative'] = null;
+    if (Number.isFinite(dStar)) {
+      const d = dStar;
+      const { lo, hi } = fromWindowFor(d);
+      const cand = new Set<number>([ceilResidue(lo, aResidue, modulus)]);
+      if (tempo.switchAt !== null) {
+        const s = lastOldEndpoint(tempo)!;
+        cand.add(ceilResidue(Math.max(lo, s - d + 1), aResidue, modulus));
+      }
+      let repFrom = Infinity;
+      for (const a of cand) {
+        if (a >= lo && a <= hi && modNonNeg(a, modulus) === aResidue && a < repFrom) repFrom = a;
+      }
+      if (Number.isFinite(repFrom)) {
+        const sp = splitSteps(tempo, repFrom, d);
+        const eb = edgeBounds(tempo, repFrom, d);
+        representative = {
+          fromLo: lo,
+          fromHi: hi,
+          from: repFrom,
+          allowed: { min: eb.L, max: eb.U },
+          oldSteps: sp.old,
+          newSteps: sp.new,
+        };
+      }
     }
 
     blockers.push({
@@ -1069,10 +1716,12 @@ function buildFailureEvidence(
       cause,
       dStar,
       delta: pf.delta,
-      timeRange: { min: Tlo, max: Thi },
+      timeRange: { min: dTime, max: dTimeHi },
       countRange: { min: Clo, max: Chi },
       intrinsicCeiling: pf.dHi,
-      achievable: { min: pj.lo - tHi, max: pj.hi - tLo },
+      achievable: { min: achMin, max: achMax },
+      representative,
+      fromRange: { min: aLo, max: aHi },
     });
   }
 
@@ -1088,36 +1737,61 @@ function buildFailureEvidence(
     const b = blockers[0];
     const pj = packets[b.j];
     const prevId = String(packets[last].id);
-    const finite = (x: number): number => (Number.isFinite(x) ? x : -1);
+    const finite = (x: number): number | undefined => (Number.isFinite(x) ? x : undefined);
     const d = b.dStar;
+    const rep = b.representative;
+
+    const tempoBreakdown = {
+      tempoSwitchAt: tempo.switchAt,
+      oldSteps: rep?.oldSteps ?? 0,
+      newSteps: rep?.newSteps ?? 0,
+      oldInterval: { min: tempo.minInterval, max: tempo.maxInterval },
+      newInterval: { min: tempo.newMinInterval, max: tempo.newMaxInterval },
+      allowedTimeGap: { min: rep?.allowed.min ?? NaN, max: rep?.allowed.max ?? NaN },
+      fromCount: rep
+        ? { min: rep.fromLo, max: rep.fromHi }
+        : { min: b.fromRange.min, max: b.fromRange.max },
+      representativeFromCount: rep?.from,
+    };
+    // Destination (candidate) absolute-count range after the residual
+    // prefix-gap and remaining-slots bounds.
+    const absoluteCountRange = {
+      min: pj.baseCount,
+      max: pj.topCount,
+      remainder: pj.remainder,
+      modulus,
+    };
+    const switchNote =
+      tempo.switchAt === null || rep === null
+        ? ''
+        : `; tempo switch at count ${tempo.switchAt}: the representative edge from count ${rep.from} ` +
+          `uses ${rep.oldSteps} old-tempo and ${rep.newSteps} new-tempo step(s), synthesizing ` +
+          `[${rep.allowed.min}, ${rep.allowed.max}] instead of applying one interval to the whole gap`;
 
     if (b.cause === 'TIME_GAP') {
-      // Smallest congruent gap that would satisfy the time-difference range.
-      const firstPositive = b.delta === 0 ? modulus : b.delta;
-      const dTiming = snap(Math.max(firstPositive, b.timeRange.min), b.timeRange.max, b.delta);
-      const dCountVal = b.dStar;
       return make({
         stage: 'extension',
         partialLength: depth,
         partialOrder,
         candidateId: pj.id,
         reason:
-          `cannot append packet ${String(pj.id)} after packet ${prevId}: the time-difference ` +
-          `constraint needs a counter gap in [${b.timeRange.min}, ${b.timeRange.max}] but the ` +
-          `absolute-count window only permits [${b.countRange.min}, ${b.countRange.max}] ` +
-          `(smallest congruent gap satisfying the count window: ${finite(dCountVal)}; satisfying ` +
-          `the time range: ${finite(dTiming)}). The tightened closed intervals only admit time ` +
-          `differences in [${b.achievable.min}, ${b.achievable.max}], so no single gap satisfies ` +
-          `both constraints`,
+          `cannot append packet ${String(pj.id)} after packet ${prevId}: the tightened closed intervals ` +
+          `only admit a time difference in [${b.achievable.min}, ${b.achievable.max}], and under the ` +
+          `effective tempo model the tempo-feasible congruent gaps are ` +
+          `[${finite(b.timeRange.min) ?? 'none'}, ${finite(b.timeRange.max) ?? 'none'}], but the ` +
+          `absolute-count window only permits congruent gaps in ` +
+          `[${finite(b.countRange.min) ?? '-∞'}, ${finite(b.countRange.max) ?? '∞'}] ` +
+          `(smallest gap satisfying the count window: ${finite(d) ?? 'none'}). No gap satisfies both; ` +
+          `this is a time/tempo conflict rather than a missing-packet estimate${switchNote}`,
         detail: {
           cause: 'TIME_GAP',
-          minimalCongruentGap: Number.isFinite(dCountVal) ? dCountVal : undefined,
-          countGap: Number.isFinite(dCountVal) ? dCountVal : undefined,
-          requiredTimeGap: Number.isFinite(dTiming)
-            ? { min: dTiming * minInterval, max: dTiming * maxInterval }
-            : undefined,
+          minimalCongruentGap: finite(d),
+          countGap: finite(d),
+          requiredTimeGap: rep ? { min: rep.allowed.min, max: rep.allowed.max } : undefined,
           actualTimeGapRange: b.achievable,
           countGapWindow: { min: b.countRange.min, max: b.countRange.max },
+          absoluteCountRange,
+          tempoBreakdown,
         },
       });
     }
@@ -1129,18 +1803,20 @@ function buildFailureEvidence(
         partialOrder,
         candidateId: pj.id,
         reason:
-          `cannot append packet ${String(pj.id)} after packet ${prevId}: the absolute-count ` +
-          `window only admits a counter gap in [${b.countRange.min}, ${b.countRange.max}] (intrinsic ` +
-          `ceiling ${b.intrinsicCeiling}), but the time-difference constraint needs a gap in ` +
-          `[${b.timeRange.min}, ${b.timeRange.max}]; the two ranges have no congruent value in common`,
+          `cannot append packet ${String(pj.id)} after packet ${prevId}: the absolute-count window ` +
+          `only admits congruent gaps in [${finite(b.countRange.min) ?? '-∞'}, ${finite(b.countRange.max) ?? '∞'}] ` +
+          `(intrinsic ceiling ${b.intrinsicCeiling}), whereas the effective tempo model requires a ` +
+          `tempo-feasible congruent gap in [${finite(b.timeRange.min) ?? 'none'}, ${finite(b.timeRange.max) ?? 'none'}] ` +
+          `for the achievable time difference [${b.achievable.min}, ${b.achievable.max}]${switchNote}; ` +
+          `the two ranges have no admissible value in common`,
         detail: {
           cause: 'COUNT_WINDOW',
-          minimalCongruentGap: Number.isFinite(d) ? d : undefined,
+          minimalCongruentGap: finite(d),
           countGapWindow: { min: b.countRange.min, max: b.countRange.max },
-          requiredTimeGap: Number.isFinite(d)
-            ? { min: d * minInterval, max: d * maxInterval }
-            : undefined,
+          requiredTimeGap: rep ? { min: rep.allowed.min, max: rep.allowed.max } : undefined,
           actualTimeGapRange: b.achievable,
+          absoluteCountRange,
+          tempoBreakdown,
         },
       });
     }
@@ -1151,15 +1827,18 @@ function buildFailureEvidence(
       partialOrder,
       candidateId: pj.id,
       reason:
-        `cannot append packet ${String(pj.id)} after packet ${prevId}: the time-feasible gap range ` +
-        `[${b.timeRange.min}, ${b.timeRange.max}] and count-feasible gap range ` +
-        `[${b.countRange.min}, ${b.countRange.max}] overlap but contain no positive counter gap ` +
-        `congruent to ${pair[last][b.j].delta} modulo ${modulus}`,
+        `cannot append packet ${String(pj.id)} after packet ${prevId}: the tempo-feasible gap range ` +
+        `[${finite(b.timeRange.min) ?? 'none'}, ${finite(b.timeRange.max) ?? 'none'}] and the count-feasible ` +
+        `range [${finite(b.countRange.min) ?? '-∞'}, ${finite(b.countRange.max) ?? '∞'}] provide no positive ` +
+        `counter gap congruent to ${b.delta} modulo ${modulus} for the achievable time difference ` +
+        `[${b.achievable.min}, ${b.achievable.max}]${switchNote}`,
       detail: {
         cause: 'CONGRUENCE',
-        minimalCongruentGap: Number.isFinite(d) ? d : undefined,
+        minimalCongruentGap: finite(d),
         countGapWindow: { min: b.countRange.min, max: b.countRange.max },
         actualTimeGapRange: b.achievable,
+        absoluteCountRange,
+        tempoBreakdown,
       },
     });
   }

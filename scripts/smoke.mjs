@@ -34,6 +34,28 @@ const expectedMissing = [
   [23, 29],
 ];
 
+// New-tempo (sampling-beat switch) sample. Old interval 9..11 applies until
+// count 19; the new interval 4..6 starts at absolute count 20. Edge C -> D
+// spans the switch (7 old steps + 3 new steps, allowed gap [75, 95]).
+const switchSample = {
+  modulus: 10,
+  countLower: 0,
+  countUpper: 60,
+  minInterval: 9,
+  maxInterval: 11,
+  tempoSwitch: { firstNewCount: 20, newMinInterval: 4, newMaxInterval: 6 },
+  packets: [
+    { id: 'F', remainder: 5, timeLower: 222, timeUpper: 228 },
+    { id: 'A', remainder: 8, timeLower: 77, timeUpper: 83 },
+    { id: 'C', remainder: 2, timeLower: 117, timeUpper: 123 },
+    { id: 'D', remainder: 2, timeLower: 207, timeUpper: 213 },
+    { id: 'E', remainder: 3, timeLower: 212, timeUpper: 218 },
+    { id: 'B', remainder: 9, timeLower: 87, timeUpper: 93 },
+  ],
+};
+const switchExpectedOrder = ['A', 'B', 'C', 'D', 'E', 'F'];
+const switchExpectedCounts = [8, 9, 12, 22, 23, 25];
+
 function fail(message) {
   console.error(`SMOKE FAILED: ${message}`);
   process.exit(1);
@@ -100,6 +122,69 @@ async function main() {
   }
   const badBody = await bad.json();
   if (badBody.status !== 'error' || !badBody.error.code) fail('error body missing stable code');
+
+  // 4. Tempo-switch recovery (new sampling beat from absolute count 20).
+  const swRes = await fetch(`${baseUrl}/api/v1/recover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(switchSample),
+  });
+  if (swRes.status !== 200) {
+    fail(`tempo-switch request returned ${swRes.status}: ${await swRes.text()}`);
+  }
+  const swBody = await swRes.json();
+  if (swBody.status !== 'ok') fail(`tempo-switch response not ok: ${JSON.stringify(swBody)}`);
+  const sw = swBody.data;
+  if (JSON.stringify(sw.order) !== JSON.stringify(switchExpectedOrder)) {
+    fail(`tempo-switch wrong order: got ${JSON.stringify(sw.order)}`);
+  }
+  if (JSON.stringify(sw.assignments.map((a) => a.absoluteCount)) !== JSON.stringify(switchExpectedCounts)) {
+    fail(`tempo-switch wrong counts: got ${JSON.stringify(sw.assignments.map((a) => a.absoluteCount))}`);
+  }
+  const span = sw.adjacency.find((e) => e.fromId === 'C' && e.toId === 'D');
+  if (!span) fail('tempo-switch missing spanning adjacency C -> D');
+  if (span.oldSteps !== 7 || span.newSteps !== 3 || span.countGap !== 10) {
+    fail(`tempo-switch step split wrong: ${JSON.stringify({ g: span.countGap, o: span.oldSteps, n: span.newSteps })}`);
+  }
+  if (span.allowedTimeGap.min !== 75 || span.allowedTimeGap.max !== 95) {
+    fail(`tempo-switch synthesized range wrong: ${JSON.stringify(span.allowedTimeGap)}`);
+  }
+  if (span.timeGap < 75 || span.timeGap > 95 || !span.satisfied) {
+    fail('tempo-switch spanning edge not satisfied');
+  }
+  for (const ev of sw.adjacency) {
+    if (ev.oldSteps + ev.newSteps !== ev.countGap) fail('tempo-switch step counts do not sum to gap');
+  }
+
+  // 5. An illegal switch descriptor must map to INVALID_REQUEST.
+  const invalidSw = await fetch(`${baseUrl}/api/v1/recover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...switchSample, tempoSwitch: { firstNewCount: 20, newMinInterval: 9 } }),
+  });
+  if (invalidSw.status !== 400) fail(`invalid switch returned HTTP ${invalidSw.status}`);
+  const invalidSwBody = await invalidSw.json();
+  if (invalidSwBody.status !== 'error' || invalidSwBody.error.code !== 'INVALID_REQUEST') {
+    fail(`invalid switch error body wrong: ${JSON.stringify(invalidSwBody)}`);
+  }
+
+  // 6. A tempo conflict (new beat too tight for the forced count gap) is a
+  //    422 with absolute-count range and old/new decomposition evidence.
+  const conflict = await fetch(`${baseUrl}/api/v1/recover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...switchSample, countUpper: 40,
+      tempoSwitch: { firstNewCount: 20, newMinInterval: 1, newMaxInterval: 2 } }),
+  });
+  if (conflict.status !== 422) fail(`tempo conflict returned HTTP ${conflict.status}`);
+  const conflictBody = await conflict.json();
+  if (conflictBody.error.code !== 'NO_CONSISTENT_INTERPRETATION') {
+    fail(`tempo conflict code wrong: ${JSON.stringify(conflictBody)}`);
+  }
+  const detail = conflictBody.error.evidence?.detail;
+  if (!detail?.absoluteCountRange || !detail?.tempoBreakdown) {
+    fail('tempo conflict evidence missing count range / tempo breakdown');
+  }
 
   console.log('SMOKE PASSED');
   console.log(`  order     : ${data.order.join(' -> ')}`);

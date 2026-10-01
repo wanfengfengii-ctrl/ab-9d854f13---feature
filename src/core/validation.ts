@@ -1,4 +1,4 @@
-import type { PacketInput, SolveRequest } from './types.js';
+import type { PacketInput, SolveRequest, TempoSwitchInput } from './types.js';
 import { SolveError } from './types.js';
 
 /**
@@ -61,6 +61,60 @@ export function validateRequest(raw: unknown): SolveRequest {
       'INVALID_REQUEST',
       'absolute count search window must not exceed 1,000,000 counters',
     );
+  }
+
+  // Optional sampling-tempo switch. Either the whole switch descriptor is
+  // absent (legacy request; behavior is unchanged) or all three fields must
+  // be present and valid — partial descriptors are rejected rather than
+  // silently merged with the old tempo.
+  let tempoSwitch: TempoSwitchInput | undefined;
+  if (obj.tempoSwitch !== undefined) {
+    const ts = obj.tempoSwitch;
+    if (typeof ts !== 'object' || ts === null || Array.isArray(ts)) {
+      throw new SolveError('INVALID_REQUEST', 'field "tempoSwitch" must be an object');
+    }
+    const tso = ts as Record<string, unknown>;
+    if (
+      !isSafeInt(tso.firstNewCount) ||
+      !isSafeInt(tso.newMinInterval) ||
+      !isSafeInt(tso.newMaxInterval)
+    ) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'tempoSwitch requires safe integer fields firstNewCount, newMinInterval and newMaxInterval',
+      );
+    }
+    const firstNewCount = tso.firstNewCount as number;
+    const newMinInterval = tso.newMinInterval as number;
+    const newMaxInterval = tso.newMaxInterval as number;
+    if (firstNewCount < countLower || firstNewCount > countUpper) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'tempoSwitch.firstNewCount must lie inside [countLower, countUpper]',
+      );
+    }
+    if (newMinInterval <= 0) {
+      throw new SolveError('INVALID_REQUEST', 'tempoSwitch.newMinInterval must be a positive integer');
+    }
+    if (newMaxInterval < newMinInterval) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'tempoSwitch.newMaxInterval must be >= tempoSwitch.newMinInterval',
+      );
+    }
+    if (newMaxInterval > 1_000_000) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'tempoSwitch.newMaxInterval must not exceed 1,000,000 to keep gap products integral',
+      );
+    }
+    if ((countUpper - countLower) * newMaxInterval > 1e13) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        '(countUpper - countLower) * tempoSwitch.newMaxInterval must not exceed 1e13',
+      );
+    }
+    tempoSwitch = { firstNewCount, newMinInterval, newMaxInterval };
   }
 
   if (!Array.isArray(obj.packets)) {
@@ -127,5 +181,5 @@ export function validateRequest(raw: unknown): SolveRequest {
     return { id: po.id as string | number, remainder, timeLower, timeUpper };
   });
 
-  return { packets, modulus, countLower, countUpper, minInterval, maxInterval };
+  return { packets, modulus, countLower, countUpper, minInterval, maxInterval, tempoSwitch };
 }

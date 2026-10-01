@@ -27,6 +27,20 @@ export interface PacketInput {
   timeUpper: number;
 }
 
+export interface TempoSwitchInput {
+  /**
+   * First absolute counter sampled under the NEW tempo. A unit step from
+   * count c to c + 1 uses the old interval when c + 1 < firstNewCount and
+   * the new interval from c + 1 >= firstNewCount onward. In other words the
+   * step arriving at this counter is the first new-tempo beat.
+   */
+  firstNewCount: number;
+  /** New sampling-interval lower bound (inclusive), positive integer. */
+  newMinInterval: number;
+  /** New sampling-interval upper bound (inclusive), >= newMinInterval. */
+  newMaxInterval: number;
+}
+
 export interface SolveRequest {
   packets: PacketInput[];
   /** Counter modulus M (rotation period), integer >= 2. */
@@ -35,10 +49,15 @@ export interface SolveRequest {
   countLower: number;
   /** Inclusive absolute-counter search window upper bound. */
   countUpper: number;
-  /** Minimum interval (inclusive) between adjacent samples. */
+  /** Minimum interval (inclusive) between adjacent samples (old tempo). */
   minInterval: number;
-  /** Maximum interval (inclusive) between adjacent samples. */
+  /** Maximum interval (inclusive) between adjacent samples (old tempo). */
   maxInterval: number;
+  /**
+   * Optional in-voyage sampling-tempo switch. When omitted the request, the
+   * three-stage adjudication and the response behave exactly as before.
+   */
+  tempoSwitch?: TempoSwitchInput;
 }
 
 /** Per-adjacent-pair constraint check evidence. */
@@ -51,6 +70,12 @@ export interface AdjacencyEvidence {
   toCount: number;
   /** toCount - fromCount (always >= 1; observed packets are distinct). */
   countGap: number;
+  /** Unit steps under the old tempo: fromCount .. min(toCount, switchCount). */
+  oldSteps: number;
+  /** Unit steps under the new tempo; 0 when the edge precedes the switch. */
+  newSteps: number;
+  /** Absolute count at which the new tempo starts (first new beat). */
+  tempoSwitchAt: number | null;
   fromTime: number;
   toTime: number;
   /** toTime - fromTime (always positive for a consistent solution). */
@@ -135,6 +160,37 @@ export interface ConstraintFailureEvidence {
     actualTimeGapRange?: { min: number; max: number };
     /** Residual gap range allowed by the absolute-count search window. */
     countGapWindow?: { min: number; max: number };
+    /**
+     * Absolute-count range scanned for the blocked successor, after applying
+     * the count window and remaining slots. Present so engineers can see
+     * which counters were tested.
+     */
+    absoluteCountRange?: {
+      min: number;
+      max: number;
+      /** Congruence residue each candidate absolute count must match. */
+      remainder: number;
+      modulus: number;
+    };
+    /**
+     * Tempo decomposition of the blocked edge. Without a switch oldSteps is
+     * the whole gap and newSteps is 0; a spanning edge shows both. Lets the
+     * engineer distinguish a missing-packet conflict from a tempo-switch
+     * conflict.
+     */
+    tempoBreakdown?: {
+      tempoSwitchAt: number | null;
+      oldSteps: number;
+      newSteps: number;
+      oldInterval: { min: number; max: number };
+      newInterval: { min: number; max: number };
+      /** Synthesized allowed time-difference range for this split. */
+      allowedTimeGap: { min: number; max: number };
+      /** Possible start (from-) counts of the blocked edge given the state. */
+      fromCount: { min: number; max: number };
+      /** Concrete representative start count used for the split, when known. */
+      representativeFromCount?: number;
+    };
   };
 }
 
