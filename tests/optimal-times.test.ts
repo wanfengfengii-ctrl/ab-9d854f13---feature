@@ -129,7 +129,11 @@ describe('optimalTimes candidate completeness', () => {
       // optimalTimes expects the solver's Packet shape; only mid2 is read.
       const order = packets.map((_, i) => i);
       const asPackets = packets as unknown as Parameters<typeof optimalTimes>[0];
-      const got = optimalTimes(asPackets, order, windows, gaps, minInterval, maxInterval);
+      const bounds = {
+        L: gaps.map((d) => d * minInterval),
+        U: gaps.map((d) => d * maxInterval),
+      };
+      const got = optimalTimes(asPackets, order, windows, bounds);
       const ref = fullDomainOptimal(packets, windows, gaps, minInterval, maxInterval);
 
       expect(got.deviation2).toBe(ref.deviation2);

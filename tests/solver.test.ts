@@ -3,7 +3,7 @@ import { solve } from '../src/core/solver.js';
 import { SolveError } from '../src/core/types.js';
 import type { PacketInput } from '../src/core/types.js';
 import { sampleRequest, sampleExpected } from './fixtures/sample.js';
-import { bruteSolve, lexIds, makeRng, type RefSolution } from './helpers/brute.js';
+import { bruteSolve, beatSpecFrom, lexIds, makeRng, refSplit, type RefSolution } from './helpers/brute.js';
 
 describe('solver: cross-week sample with missing packets', () => {
   const result = solve(

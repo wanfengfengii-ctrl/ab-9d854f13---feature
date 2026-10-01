@@ -3,7 +3,9 @@ import type {
   AssignedPacket,
   MissingSegment,
   PacketInput,
+  BeatSwitchInput,
   ConstraintFailureEvidence,
+  BeatBlockerDetail,
   SolveResult,
 } from './types.js';
 import { SolveError } from './types.js';
@@ -26,23 +28,57 @@ interface Packet {
   symGroup: number;
 }
 
-/** Intrinsic feasibility of an adjacency i -> j: congruent d in [dLo, dHi]. */
-interface PairFeas {
-  /** Required residue d ≡ delta (mod modulus); 0 means a multiple. */
-  delta: number;
-  dLo: number;
-  dHi: number;
+/**
+ * Beat configuration. The step c -> c+1 uses the OLD interval when its
+ * endpoint count c+1 is strictly earlier than the switch point
+ * (`switchAt` = the submitted firstNewBeatCount), and the NEW interval
+ * otherwise (endpoint >= switchAt). An adjacency starting at absolute count
+ * a with gap d therefore splits into
+ *   oldSteps = clamp(switchAt - 1 - a, 0, d)
+ *   newSteps = d - oldSteps
+ * and its admissible time difference is the SUM of the per-beat ranges, so a
+ * gap straddling the switch is never judged under a single beat.
+ *
+ * At most one edge of a strictly increasing chain can straddle the switch.
+ * When the request does not enable a switch, enabled=false and every
+ * beat-aware formula reduces to the single-beat model.
+ */
+interface BeatConfig {
+  enabled: boolean;
+  switchAt: number;
+  oldLo: number;
+  oldHi: number;
+  newLo: number;
+  newHi: number;
 }
 
-interface DeadState {
-  depth: number;
-  placed: number[];
-  last: number;
-  S: number;
-  c0lo: number;
-  c0hi: number;
-  tLo: number;
-  tHi: number;
+function makeBeatConfig(
+  bs: BeatSwitchInput | undefined,
+  oldLo: number,
+  oldHi: number,
+): BeatConfig {
+  if (!bs) {
+    return { enabled: false, switchAt: Number.POSITIVE_INFINITY, oldLo, oldHi, newLo: oldLo, newHi: oldHi };
+  }
+  return {
+    enabled: true,
+    switchAt: bs.firstNewBeatCount,
+    oldLo,
+    oldHi,
+    newLo: bs.newMinInterval,
+    newHi: bs.newMaxInterval,
+  };
+}
+
+/** {oldSteps, newSteps} of the edge starting at absolute count `a`. */
+function splitSteps(beat: BeatConfig, a: number, d: number): { oldSteps: number; newSteps: number } {
+  const o = beat.switchAt - 1 - a;
+  const oldSteps = o <= 0 ? 0 : o >= d ? d : o;
+  return { oldSteps, newSteps: d - oldSteps };
+}
+
+function clampInt(v: number, lo: number, hi: number): number {
+  return v <= lo ? lo : v >= hi ? hi : v;
 }
 
 function modNonNeg(a: number, m: number): number {
@@ -79,32 +115,32 @@ function minDeviation2(lo: number, hi: number, mid2: number): number {
 }
 
 /**
- * Tighten timestamp windows for a fixed complete order and gap sequence.
- * Forward pass intersects [t_prev + L, t_prev + U]; backward pass intersects
- * [t_next - U, t_next - L]. Nonempty forward windows already imply global
- * feasibility of the difference-constraint chain; the backward pass only
- * shrinks domains for the deviation optimizer. Null = defensively infeasible.
+ * Tighten timestamp windows for a fixed complete order with per-edge lower
+ * and upper admissible time differences. The forward pass intersects
+ * [t_prev + L_e, t_prev + U_e]; the backward pass intersects
+ * [t_next - U_e, t_next - L_e]. Nonempty forward windows already imply
+ * global feasibility of the difference-constraint chain; the backward pass
+ * only shrinks domains for the deviation optimizer. Null = infeasible.
  */
 function tightenWindows(
   packets: Packet[],
   order: number[],
-  gaps: number[],
-  minInterval: number,
-  maxInterval: number,
+  L: number[],
+  U: number[],
 ): { lo: number; hi: number }[] | null {
   const n = order.length;
   const win = new Array<{ lo: number; hi: number }>(n);
   win[0] = { lo: packets[order[0]].lo, hi: packets[order[0]].hi };
   for (let k = 1; k < n; k++) {
     const p = packets[order[k]];
-    const lo = Math.max(p.lo, win[k - 1].lo + gaps[k - 1] * minInterval);
-    const hi = Math.min(p.hi, win[k - 1].hi + gaps[k - 1] * maxInterval);
+    const lo = Math.max(p.lo, win[k - 1].lo + L[k - 1]);
+    const hi = Math.min(p.hi, win[k - 1].hi + U[k - 1]);
     if (lo > hi) return null;
     win[k] = { lo, hi };
   }
   for (let k = n - 2; k >= 0; k--) {
-    const lo = Math.max(win[k].lo, win[k + 1].lo - gaps[k] * maxInterval);
-    const hi = Math.min(win[k].hi, win[k + 1].hi - gaps[k] * minInterval);
+    const lo = Math.max(win[k].lo, win[k + 1].lo - U[k]);
+    const hi = Math.min(win[k].hi, win[k + 1].hi - L[k]);
     if (lo > hi) return null;
     win[k] = { lo, hi };
   }
@@ -113,7 +149,10 @@ function tightenWindows(
 
 /**
  * Minimize Σ |2 t_k - mid2_k| over integer timestamps subject to
- * t_k ∈ window_k and L_e ≤ t_{e+1} - t_e ≤ U_e, for a FIXED order.
+ * t_k ∈ window_k and L_e ≤ t_{e+1} - t_e ≤ U_e, for a FIXED order with
+ * per-edge bounds. Without a beat switch every edge carries
+ * (d·minInterval, d·maxInterval); with a switch a straddling edge carries
+ * its composed old+new bounds.
  *
  * Exported for direct differential testing against a full-domain DP.
  *
@@ -121,8 +160,8 @@ function tightenWindows(
  * variable is pinned — directly or through a chain of tight lower/upper edge
  * constraints — to a pivot: an interval bound or one of the two integers
  * adjacent to its midpoint. Propagating every pivot along every lower/upper
- * pin chain gives O(n · 2^n) candidate values per position (n ≤ 14). A
- * backward shortest-path DP with monotone sliding-window minima computes the
+ * pin chain gives the candidate values per position (n ≤ 14). A backward
+ * shortest-path DP with a monotone sliding-window minimum computes the
  * optimum; the forward greedy reconstruction returns the lexicographically
  * smallest optimal timestamp vector.
  */
@@ -130,13 +169,10 @@ export function optimalTimes(
   packets: Packet[],
   order: number[],
   windows: { lo: number; hi: number }[],
-  gaps: number[],
-  minInterval: number,
-  maxInterval: number,
+  bounds: { L: number[]; U: number[] },
 ): { times: number[]; deviation2: number } {
   const n = order.length;
-  const L = gaps.map((d) => d * minInterval);
-  const U = gaps.map((d) => d * maxInterval);
+  const { L, U } = bounds;
 
   const candSets: Set<number>[] = windows.map(() => new Set<number>());
   const add = (k: number, v: number): void => {
@@ -244,9 +280,30 @@ interface Move {
   tHi: number;
 }
 
+interface DeadState {
+  depth: number;
+  placed: number[];
+  gaps: number[];
+  last: number;
+  S: number;
+  c0lo: number;
+  c0hi: number;
+  tLo: number;
+  tHi: number;
+}
+
+/** Certified leaf interpretation under a beat switch (or single beat). */
+interface CertifiedLeaf {
+  c0: number;
+  L: number[];
+  U: number[];
+  times: number[];
+  deviation2: number;
+}
+
 /**
  * Jointly recover transmission order, wrap-crossing absolute counters and
- * transmit timestamps.
+ * transmit timestamps, optionally across an in-voyage sampling-beat switch.
  *
  * Optimization is lexicographic:
  *   1. missing packet count between first/last observed packet
@@ -263,6 +320,13 @@ interface Move {
  * may only be consumed in ascending id order, which never removes the
  * lex-min solution but collapses permutation families.
  *
+ * Beat-switch soundness: search propagates a relaxed existential box over
+ * the first absolute count (its edge bounds depend on where the unique
+ * straddling edge lands) and every leaf is certified EXACTLY: candidate
+ * first counts come from (i) the all-old/all-new regions and (ii)
+ * tight-chain pivots solved for the straddling edge's old/new step split, so
+ * no infeasible interpretation is ever accepted.
+ *
  * Throws SolveError(NO_CONSISTENT_INTERPRETATION) with first-failure evidence.
  */
 export function solve(
@@ -272,9 +336,13 @@ export function solve(
   countUpper: number,
   minInterval: number,
   maxInterval: number,
+  beatSwitchInput?: BeatSwitchInput,
 ): SolveResult {
   const n = inputs.length;
   const W = countUpper - countLower;
+  const beat = makeBeatConfig(beatSwitchInput, minInterval, maxInterval);
+  const minBeatLo = Math.min(beat.oldLo, beat.newLo);
+  const maxBeatHi = Math.max(beat.oldHi, beat.newHi);
 
   // Group identical (remainder, lo, hi) packets for symmetry breaking.
   const groups = new Map<string, number[]>();
@@ -310,25 +378,24 @@ export function solve(
     symGroup: symGroup[index],
   }));
 
-  // Intrinsic adjacency feasibility = congruent-gap RANGE per ordered pair.
-  // Time: L_d ≤ t_j - t_i ≤ U_d with t_i∈I_i, t_j∈I_j:
-  //   d ≥ ceil((lo_j - hi_i)/maxInterval), d ≤ floor((hi_j - lo_i)/minInterval).
-  // Counts: c_i, c_j = c_i + d both inside the search window:
-  //   base_j - top_i ≤ d ≤ top_j - base_i.
-  const pair: PairFeas[][] = packets.map((pi) =>
-    packets.map((pj): PairFeas => {
+  // Intrinsic adjacency feasibility from the absolute-count side:
+  // congruent d in [dLo, dHi] with both endpoints in the search window.
+  //   base_j - top_i <= d <= top_j - base_i.
+  // In the single-beat model the RAW interval bounds are also position-
+  // independent, so they are folded into the intrinsic table exactly as
+  // before (keeping adjudication and evidence byte-compatible). With a beat
+  // switch timing depends on the edge's absolute position, so it is enforced
+  // per move instead.
+  const pair: { delta: number; dLo: number; dHi: number }[][] = packets.map((pi) =>
+    packets.map((pj) => {
       const delta = modNonNeg(pj.remainder - pi.remainder, modulus);
       const d0 = pi.index === pj.index ? Infinity : delta === 0 ? modulus : delta;
-      const dLo = Math.max(
-        d0,
-        Math.ceil((pj.lo - pi.hi) / maxInterval),
-        pj.baseCount - pi.topCount,
-      );
-      const dHi = Math.min(
-        W,
-        Math.floor((pj.hi - pi.lo) / minInterval),
-        pj.topCount - pi.baseCount,
-      );
+      let dLo = Math.max(d0, pj.baseCount - pi.topCount);
+      let dHi = Math.min(W, pj.topCount - pi.baseCount);
+      if (!beat.enabled) {
+        dLo = Math.max(dLo, Math.ceil((pj.lo - pi.hi) / beat.oldHi));
+        dHi = Math.min(dHi, Math.floor((pj.hi - pi.lo) / beat.oldLo));
+      }
       return { delta, dLo, dHi };
     }),
   );
@@ -342,7 +409,8 @@ export function solve(
   );
 
   // cont[mask][j] = minimum gap sum of a path starting at j visiting all
-  // nodes of `mask` (j ∉ mask). Exact admissible completion bound, O(2^n n²).
+  // nodes of `mask` (j not in mask). A relaxed (count/congruence only) but
+  // admissible completion lower bound, O(2^n n^2).
   const full = (1 << n) - 1;
   const cont: number[][] = Array.from({ length: 1 << n }, () => new Array<number>(n).fill(Infinity));
   for (let j = 0; j < n; j++) cont[0][j] = 0;
@@ -373,7 +441,24 @@ export function solve(
         candidateId: packets[0].id,
         reason:
           `no packet can be seeded inside [${countLower}, ${countUpper}] while leaving ` +
-          `room for ${n - 1} further strictly increasing absolute counters`,
+          `room for ${n - 1} further strictly increasing absolute counters` +
+          (beat.enabled
+            ? ` (beat switch at count ${beat.switchAt}: old interval [${beat.oldLo}, ${beat.oldHi}], ` +
+              `new interval [${beat.newLo}, ${beat.newHi}])`
+            : ''),
+        // Extra detail only accompanies a beat-switch request; the
+        // single-beat response stays exactly as before.
+        ...(beat.enabled
+          ? {
+              detail: {
+                cause: 'COUNT_WINDOW' as const,
+                absoluteCountRange: {
+                  from: { min: countLower, max: countUpper - n + 1 },
+                  to: { min: countLower + n - 1, max: countUpper },
+                },
+              },
+            }
+          : {}),
       },
     );
   }
@@ -395,6 +480,29 @@ export function solve(
     return bits;
   };
 
+  /**
+   * Full-prefix signature. Required for sound memoization with a beat
+   * switch: edge bounds depend on the edge's absolute start count, so two
+   * paths sharing (used set, last, frontier boxes) but differing in packet
+   * order / gaps are NOT interchangeable. In single-beat mode the short
+   * frontier key is sufficient and preserves the original memo granularity.
+   */
+  const prefixSignature = (
+    depth: number,
+    last: number,
+    S: number,
+    c0lo: number,
+    c0hi: number,
+    tLo: number,
+    tHi: number,
+  ): string => {
+    let s = `${depth}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
+    for (let k = 0; k < depth; k++) {
+      s += `>${orderArr[k]}:${k > 0 ? gapsArr[k - 1] : 0}:${tLoArr[k]},${tHiArr[k]}`;
+    }
+    return s;
+  };
+
   /** Symmetry leader: within a twin group only the smallest-ranked still
    * unused member may be picked next. Relabeling identical twins never
    * changes the objectives, and the lex-min order always consumes them in
@@ -411,6 +519,35 @@ export function solve(
     return true;
   };
 
+  /**
+   * Relaxed existential bounds of the edge with gap d from the current
+   * frontier over the first-count box [c0lo, c0hi]. Returns the smallest /
+   * largest admissible time difference attainable by SOME first count in the
+   * box. Sound for pruning (a necessary condition); leaf certification is
+   * exact. Without a beat switch these are simply d times the old interval.
+   */
+  const edgeEnvelope = (
+    d: number,
+    S: number,
+    c0lo: number,
+    c0hi: number,
+  ): { lMin: number; uMax: number; sMin: number; sMax: number } => {
+    if (!beat.enabled) {
+      return { lMin: d * beat.oldLo, uMax: d * beat.oldHi, sMin: d, sMax: d };
+    }
+    // oldSteps = clamp(switchAt - 1 - S - c0, 0, d), decreasing in c0.
+    const sMax = clampInt(beat.switchAt - 1 - S - c0lo, 0, d);
+    const sMin = clampInt(beat.switchAt - 1 - S - c0hi, 0, d);
+    const lAt = (s: number): number => s * beat.oldLo + (d - s) * beat.newLo;
+    const uAt = (s: number): number => s * beat.oldHi + (d - s) * beat.newHi;
+    return {
+      lMin: Math.min(lAt(sMin), lAt(sMax)),
+      uMax: Math.max(uAt(sMin), uAt(sMax)),
+      sMin,
+      sMax,
+    };
+  };
+
   /** Successors in canonical order: every congruent feasible gap per target,
    * sorted by smallest gap then smallest target id. */
   const enumerateMoves = (
@@ -424,22 +561,25 @@ export function solve(
     mask: number,
   ): Move[] => {
     const slotsAfter = n - 1 - depth;
+    const cap = countUpper - slotsAfter;
     const moves: Move[] = [];
     for (let j = 0; j < n; j++) {
       if (mask & (1 << j)) continue;
       if (!isSymmetryAllowed(j, mask)) continue;
       const pj = packets[j];
       const pf = pair[last][j];
+      // Coarse scalar time floor/ceiling using the extreme beat bounds; the
+      // composed envelope below decides each concrete gap.
       const dLo = Math.max(
         pf.dLo,
         pj.baseCount - S - c0hi,
-        Math.ceil((pj.lo - tHi) / maxInterval),
+        Math.ceil((pj.lo - tHi) / maxBeatHi),
       );
       const dHi0 = Math.min(
         pf.dHi,
         pj.topCount - S - c0lo,
-        countUpper - slotsAfter - S - c0lo,
-        Math.floor((pj.hi - tLo) / minInterval),
+        cap - S - c0lo,
+        Math.floor((pj.hi - tLo) / minBeatLo),
       );
       if (dLo > dHi0) continue;
       const dMin = ceilResidue(dLo, pf.delta, modulus);
@@ -447,17 +587,24 @@ export function solve(
 
       const consider = (d: number): Move | null => {
         const njLo = Math.max(c0lo, pj.baseCount - S - d);
-        const njHi = Math.min(c0hi, pj.topCount - S - d, countUpper - slotsAfter - S - d);
-        const ntLo = Math.max(pj.lo, tLo + d * minInterval);
-        const ntHi = Math.min(pj.hi, tHi + d * maxInterval);
-        if (njLo > njHi || ntLo > ntHi) return null;
+        const njHi = Math.min(c0hi, pj.topCount - S - d, cap - S - d);
+        if (njLo > njHi) return null;
+        const env = edgeEnvelope(d, S, njLo, njHi);
+        const ntLo = Math.max(pj.lo, tLo + env.lMin);
+        const ntHi = Math.min(pj.hi, tHi + env.uMax);
+        if (ntLo > ntHi) return null;
         return { j, d, c0lo: njLo, c0hi: njHi, tLo: ntLo, tHi: ntHi };
       };
 
       for (let d = dMin; d <= dHi0; d += modulus) {
-        // The rising time lower bound is monotone in d; once it passes j's
-        // interval no larger gap can work.
-        if (d * minInterval > pj.hi - tLo) break;
+        // The composed rising lower bound is monotone in d; once it passes
+        // j's interval no larger gap can work.
+        const njLo0 = Math.max(c0lo, pj.baseCount - S - d);
+        const njHi0 = Math.min(c0hi, pj.topCount - S - d, cap - S - d);
+        if (njLo0 <= njHi0) {
+          const env = edgeEnvelope(d, S, njLo0, njHi0);
+          if (env.lMin > pj.hi - tLo) break;
+        }
         const mv = consider(d);
         if (mv) moves.push(mv);
       }
@@ -476,8 +623,265 @@ export function solve(
     tHi: number,
   ): void => {
     if (bestDead === null || depth > bestDead.depth) {
-      bestDead = { depth, placed: orderArr.slice(0, depth), last, S, c0lo, c0hi, tLo, tHi };
+      bestDead = {
+        depth,
+        placed: orderArr.slice(0, depth),
+        gaps: gapsArr.slice(0, Math.max(0, depth - 1)),
+        last,
+        S,
+        c0lo,
+        c0hi,
+        tLo,
+        tHi,
+      };
     }
+  };
+
+  // ------------------------------------------------------- leaf certification
+  /**
+   * Certify a complete (order, gaps, first-count box) EXACTLY and return the
+   * best (minimum midpoint deviation) first count / timestamps, or null when
+   * the relaxed search reached a leaf that no concrete first count satisfies.
+   *
+   * The edge bounds are constants once the old/new step split of the unique
+   * straddling edge is fixed. Candidate first counts come from:
+   *   - the all-old region (last edge ending before the switch),
+   *   - the all-new region (first edge starting at/after switchAt - 1),
+   *   - for each possible straddling edge e and each old-step count s,
+   *     c0 = switchAt - 1 - S_e - s; feasible/optimal integer s values are
+   *     enumerated via tight-chain pivots (an affine-in-s relation pinned to
+   *     an interval/midpoint pivot), exactly as in optimalTimes.
+   */
+  const certCache = new Map<string, CertifiedLeaf | null>();
+
+  interface Aff {
+    /** coefficient of s */
+    a: number;
+    b: number;
+  }
+
+  const certifyLeaf = (
+    order: number[],
+    gaps: number[],
+    c0lo: number,
+    c0hi: number,
+  ): CertifiedLeaf | null => {
+    const key = `${order.join(',')}|${gaps.join(',')}|${c0lo}|${c0hi}`;
+    const cached = certCache.get(key);
+    if (cached !== undefined) return cached;
+
+    let Ssum = 0;
+    for (const d of gaps) Ssum += d;
+    const r0 = packets[order[0]].remainder;
+
+    const evaluate = (c0: number, L: number[], U: number[]): CertifiedLeaf | null => {
+      if (c0 < c0lo || c0 > c0hi) return null;
+      if (modNonNeg(c0, modulus) !== r0) return null;
+      if (c0 < countLower || c0 + Ssum > countUpper) return null;
+      // Defensive congruence/window check on every assigned count.
+      let cc = c0;
+      for (let k = 0; k < n; k++) {
+        if (modNonNeg(cc, modulus) !== packets[order[k]].remainder) return null;
+        if (cc < countLower || cc > countUpper) return null;
+        if (k < n - 1) cc += gaps[k];
+      }
+      const windows = tightenWindows(packets, order, L, U);
+      if (windows === null) return null;
+      const { times, deviation2 } = optimalTimes(packets, order, windows, { L, U });
+      return { c0, L: L.slice(), U: U.slice(), times, deviation2 };
+    };
+
+    let best: CertifiedLeaf | null = null;
+    const consider = (leaf: CertifiedLeaf | null): void => {
+      if (leaf && (best === null || leaf.deviation2 < best.deviation2 ||
+        (leaf.deviation2 === best.deviation2 && leaf.c0 < best.c0))) {
+        best = leaf;
+      }
+    };
+
+    if (!beat.enabled) {
+      const L = gaps.map((d) => d * beat.oldLo);
+      const U = gaps.map((d) => d * beat.oldHi);
+      const c0 = ceilResidue(c0lo, r0, modulus);
+      if (c0 <= c0hi) consider(evaluate(c0, L, U));
+      certCache.set(key, best);
+      return best;
+    }
+
+    const T = beat.switchAt;
+
+    // (1) All-old region: the final edge ends at a count <= T - 1.
+    {
+      const hi = Math.min(c0hi, T - 1 - Ssum);
+      const c0 = ceilResidue(c0lo, r0, modulus);
+      if (c0 <= hi) {
+        const L = gaps.map((d) => d * beat.oldLo);
+        const U = gaps.map((d) => d * beat.oldHi);
+        consider(evaluate(c0, L, U));
+      }
+    }
+
+    // (2) All-new region: the first edge starts at a count >= T - 1.
+    {
+      const lo = Math.max(c0lo, T - 1);
+      const c0 = ceilResidue(lo, r0, modulus);
+      if (c0 <= c0hi) {
+        const L = gaps.map((d) => d * beat.newLo);
+        const U = gaps.map((d) => d * beat.newHi);
+        consider(evaluate(c0, L, U));
+      }
+    }
+
+    // (2b) The switch boundary lands EXACTLY on an observed vertex:
+    // c_v = T - 1 for some internal vertex v, so edges 0..v-1 are entirely
+    // old (they end at or before T - 1) and edges v..n-2 entirely new (they
+    // start at or after T - 1), with no straddling edge.
+    let Sv = 0;
+    for (let v = 1; v < n - 1; v++) {
+      Sv += gaps[v - 1];
+      const c0 = T - 1 - Sv;
+      if (c0 < c0lo || c0 > c0hi) continue;
+      if (modNonNeg(c0, modulus) !== r0) continue;
+      const L = gaps.map((dd, k) => (k < v ? dd * beat.oldLo : dd * beat.newLo));
+      const U = gaps.map((dd, k) => (k < v ? dd * beat.oldHi : dd * beat.newHi));
+      consider(evaluate(c0, L, U));
+    }
+
+    // (3) A single edge e straddles the switch: enumerate old-step counts s.
+    const rawS = new Set<number>();
+    let Sprefix = 0;
+    for (let e = 0; e < n - 1; e++) {
+      const d = gaps[e];
+      if (d < 2) {
+        Sprefix += d;
+        continue;
+      }
+      // Edge bounds as affine functions of s (old-step count on edge e):
+      //   L_e(s) = s*oldLo + (d-s)*newLo = d*newLo + s*(oldLo-newLo)
+      //   U_e(s) = d*newHi + s*(oldHi-newHi)
+      const edgeL = (k: number): Aff => {
+        if (k < e) return { a: 0, b: gaps[k] * beat.oldLo };
+        if (k > e) return { a: 0, b: gaps[k] * beat.newLo };
+        return { a: beat.oldLo - beat.newLo, b: d * beat.newLo };
+      };
+      const edgeU = (k: number): Aff => {
+        if (k < e) return { a: 0, b: gaps[k] * beat.oldHi };
+        if (k > e) return { a: 0, b: gaps[k] * beat.newHi };
+        return { a: beat.oldHi - beat.newHi, b: d * beat.newHi };
+      };
+
+      // Affine tight-chain values reachable at every position, starting from
+      // each position's own pivots (interval bounds + midpoint neighbours).
+      const seenSig: Set<string>[] = Array.from({ length: n }, () => new Set<string>());
+      const affAt: Aff[][] = Array.from({ length: n }, () => []);
+      const putAff = (k: number, v: Aff): void => {
+        const sig = `${v.a}/${v.b}`;
+        if (!seenSig[k].has(sig)) {
+          seenSig[k].add(sig);
+          affAt[k].push(v);
+        }
+      };
+      const pivots = (k: number): number[] => {
+        const p = packets[order[k]];
+        const f = Math.floor(p.mid2 / 2);
+        const c = p.mid2 % 2 === 0 ? f : f + 1;
+        return [p.lo, p.hi, f, c];
+      };
+
+      const goFwd = (pos: number, v: Aff): void => {
+        putAff(pos, v);
+        if (pos < n - 1) {
+          const l = edgeL(pos);
+          const u = edgeU(pos);
+          goFwd(pos + 1, { a: v.a + l.a, b: v.b + l.b });
+          goFwd(pos + 1, { a: v.a + u.a, b: v.b + u.b });
+        }
+      };
+      const goBwd = (pos: number, v: Aff): void => {
+        putAff(pos, v);
+        if (pos > 0) {
+          const l = edgeL(pos - 1);
+          const u = edgeU(pos - 1);
+          goBwd(pos - 1, { a: v.a - l.a, b: v.b - l.b });
+          goBwd(pos - 1, { a: v.a - u.a, b: v.b - u.b });
+        }
+      };
+      for (let j = 0; j < n; j++) {
+        for (const pv of pivots(j)) {
+          putAff(j, { a: 0, b: pv });
+          if (j < n - 1) {
+            const l = edgeL(j);
+            const u = edgeU(j);
+            goFwd(j + 1, { a: l.a, b: pv + l.b });
+            goFwd(j + 1, { a: u.a, b: pv + u.b });
+          }
+          if (j > 0) {
+            const l = edgeL(j - 1);
+            const u = edgeU(j - 1);
+            goBwd(j - 1, { a: -l.a, b: pv - l.b });
+            goBwd(j - 1, { a: -u.a, b: pv - u.b });
+          }
+        }
+      }
+
+      // Pin every reachable affine value to every pivot of its position:
+      // a*s + b = pivot  =>  s = (pivot - b) / a.
+      const addRational = (num: number, den: number): void => {
+        if (den === 0) return;
+        // Exact floor/ceil with BigInt to stay exact around integers.
+        const N = BigInt(num);
+        const D = BigInt(den);
+        const f = N / D; // truncates toward zero
+        const floor = f - (N % D !== 0n && (N < 0n) !== (D < 0n) ? 1n : 0n);
+        const ceil = floor + (N % D !== 0n ? 1n : 0n);
+        rawS.add(Number(floor));
+        rawS.add(Number(ceil));
+      };
+      for (let k = 0; k < n; k++) {
+        for (const v of affAt[k]) {
+          if (v.a === 0) continue;
+          for (const pv of pivots(k)) addRational(pv - v.b, v.a);
+        }
+      }
+      rawS.add(1);
+      rawS.add(d - 1);
+
+      // c0 = T - 1 - Sprefix - s must be congruent to r0 modulo modulus:
+      // s ≡ T - 1 - Sprefix - r0 (mod modulus).
+      const sResidue = modNonNeg(T - 1 - Sprefix - r0, modulus);
+      // c0 box restricts s to [T-1-Sprefix-c0hi, T-1-Sprefix-c0lo].
+      const sLoBox = Math.max(1, T - 1 - Sprefix - c0hi);
+      const sHiBox = Math.min(d - 1, T - 1 - Sprefix - c0lo);
+      const tryS = new Set<number>();
+      for (const rs of rawS) {
+        // Valid residue-grid neighbours on both sides of the breakpoint.
+        const up = ceilResidue(Math.max(rs - 1, sLoBox), sResidue, modulus);
+        const down = floorResidue(Math.min(rs + 1, sHiBox), sResidue, modulus);
+        tryS.add(up);
+        tryS.add(down);
+      }
+      tryS.add(ceilResidue(sLoBox, sResidue, modulus));
+      tryS.add(floorResidue(sHiBox, sResidue, modulus));
+      for (const cand of tryS) {
+        if (cand < sLoBox || cand > sHiBox) continue;
+        const c0 = T - 1 - Sprefix - cand;
+        const L = gaps.map((dd, k) => {
+          if (k < e) return dd * beat.oldLo;
+          if (k > e) return dd * beat.newLo;
+          return cand * beat.oldLo + (dd - cand) * beat.newLo;
+        });
+        const U = gaps.map((dd, k) => {
+          if (k < e) return dd * beat.oldHi;
+          if (k > e) return dd * beat.newHi;
+          return cand * beat.oldHi + (dd - cand) * beat.newHi;
+        });
+        consider(evaluate(c0, L, U));
+      }
+      Sprefix += d;
+    }
+
+    certCache.set(key, best);
+    return best;
   };
 
   // ------------------------------------------------------------------ Phase A
@@ -491,6 +895,12 @@ export function solve(
   const dfsA = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): number => {
     if (stopA) return Infinity;
     if (depth === n) {
+      // Relaxed propagation is exact for the single-beat model; with a beat
+      // switch certify a concrete first count before accepting the leaf.
+      if (beat.enabled && certifyLeaf(orderArr.slice(), gapsArr.slice(), c0lo, c0hi) === null) {
+        recordDead(depth, last, S, c0lo, c0hi, tLo, tHi);
+        return Infinity;
+      }
       if (S < bestA) bestA = S;
       if (bestA === globalPrimaryLB) stopA = true;
       return S;
@@ -502,7 +912,9 @@ export function solve(
     // deepest non-extendable state for failure evidence.
     if (Number.isFinite(bestA) && S + cont[remaining][last] >= bestA) return Infinity;
 
-    const key = `A|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
+    const key = beat.enabled
+      ? `A|${prefixSignature(depth, last, S, c0lo, c0hi, tLo, tHi)}`
+      : `A|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
     const cached = memoA.get(key);
     if (cached !== undefined) return cached;
 
@@ -544,14 +956,19 @@ export function solve(
     dfsA(1, seed.index, 0, seed.baseCount, c0hi0, seed.lo, seed.hi);
   }
   if (bestA === Infinity) {
-    throw buildFailureEvidence(packets, pair, bestDead, modulus, countUpper, minInterval, maxInterval);
+    throw buildFailureEvidence(
+      packets,
+      pair,
+      bestDead,
+      modulus,
+      countLower,
+      countUpper,
+      beat,
+    );
   }
   const Pstar = bestA;
 
   // ------------------------------------------------------------- Phase B/C key
-  // Deviation-relevant state also records the per-position tightened windows
-  // AND interval identities (midpoint sequence), since converging paths with
-  // different packet types at prefix positions are not interchangeable.
   /** Exact state signature for the deviation/lex phases: full prefix packet
    * sequence, its gaps and every position's tightened window. Paths sharing
    * this signature have identical prefix deviation and an identical frontier,
@@ -566,14 +983,9 @@ export function solve(
 
   /**
    * Exact primary-optimal-chain oracle. Returns true exactly when a
-   * completion of the CURRENT state reaches total gap Pstar. Unlike the
-   * intrinsic Held-Karp bound, this accounts for time/count feasibility, so
-   * it is the correct filter for the deviation and lexicographic phases.
-   *
-   * The state is Markovian in (used mask, last packet, fixed gap sum S,
-   * tightened c0 window and last timestamp window): difference constraints on
-   * an ordered chain mean earlier prefix positions influence the future only
-   * through the last packet's tightened window.
+   * completion of the CURRENT state reaches total gap Pstar with a concrete
+   * certifiable first count. The state is Markovian in (used mask, last
+   * packet, fixed gap sum S, tightened c0 window and last timestamp window).
    */
   const memoOpt = new Map<string, boolean>();
   const optimalFromState = (
@@ -586,8 +998,16 @@ export function solve(
     tHi: number,
     mask: number,
   ): boolean => {
-    if (depth === n) return S === Pstar;
-    const key = `O|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
+    if (depth === n) {
+      if (S !== Pstar) return false;
+      if (beat.enabled && certifyLeaf(orderArr.slice(), gapsArr.slice(), c0lo, c0hi) === null) {
+        return false;
+      }
+      return true;
+    }
+    const key = beat.enabled
+      ? `O|${prefixSignature(depth, last, S, c0lo, c0hi, tLo, tHi)}|${mask}`
+      : `O|${mask}|${last}|${S}|${c0lo}|${c0hi}|${tLo}|${tHi}`;
     const cached = memoOpt.get(key);
     if (cached !== undefined) return cached;
 
@@ -598,6 +1018,10 @@ export function solve(
       // Necessary bound for reaching Pstar; exact feasibility checked below.
       if (S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] > Pstar) continue;
       used[mv.j] = 1;
+      orderArr[depth] = mv.j;
+      gapsArr[depth - 1] = mv.d;
+      tLoArr[depth] = mv.tLo;
+      tHiArr[depth] = mv.tHi;
       const v = optimalFromState(
         depth + 1,
         mv.j,
@@ -633,7 +1057,15 @@ export function solve(
     const all = enumerateMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask);
     return all.filter((mv) => {
       if (S + mv.d + cont[remaining ^ (1 << mv.j)][mv.j] > Pstar) return false;
-      return optimalFromState(
+      // The beat-aware oracle key is a full-prefix signature, so the shared
+      // prefix arrays must describe exactly this candidate move while the
+      // oracle runs. (In single-beat mode these slots are not read.)
+      used[mv.j] = 1;
+      orderArr[depth] = mv.j;
+      gapsArr[depth - 1] = mv.d;
+      tLoArr[depth] = mv.tLo;
+      tHiArr[depth] = mv.tHi;
+      const v = optimalFromState(
         depth + 1,
         mv.j,
         S + mv.d,
@@ -643,6 +1075,8 @@ export function solve(
         mv.tHi,
         mask | (1 << mv.j),
       );
+      used[mv.j] = 0;
+      return v;
     });
   };
 
@@ -651,15 +1085,20 @@ export function solve(
     const seed = packets[seedIndex];
     const c0hi0 = Math.min(seed.topCount, countUpper - n + 1);
     if (seed.baseCount > c0hi0) return false;
+    // Establish shared-array state exactly like the phase A/B/C seed loops:
+    // the oracle's prefix signature and leaf certification read orderArr, so
+    // a stale slot from a previous probe would certify the wrong packet.
+    used.fill(0);
+    used[seedIndex] = 1;
+    orderArr[0] = seedIndex;
+    tLoArr[0] = seed.lo;
+    tHiArr[0] = seed.hi;
     return optimalFromState(1, seedIndex, 0, seed.baseCount, c0hi0, seed.lo, seed.hi, 1 << seedIndex);
   };
 
-  const leafDeviation = (): number => {
-    const order = orderArr.slice();
-    const gaps = gapsArr.slice();
-    const windows = tightenWindows(packets, order, gaps, minInterval, maxInterval);
-    if (windows === null) return Infinity;
-    return optimalTimes(packets, order, windows, gaps, minInterval, maxInterval).deviation2;
+  const leafDeviation = (c0lo: number, c0hi: number): number => {
+    const cert = certifyLeaf(orderArr.slice(), gapsArr.slice(), c0lo, c0hi);
+    return cert === null ? Infinity : cert.deviation2;
   };
 
   // ------------------------------------------------------------------ Phase B
@@ -678,7 +1117,7 @@ export function solve(
 
   const dfsB = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): number => {
     if (depth === n) {
-      const v = leafDeviation();
+      const v = leafDeviation(c0lo, c0hi);
       if (v < bestB) bestB = v;
       return v;
     }
@@ -738,7 +1177,7 @@ export function solve(
 
   const dfsCfeasible = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number): boolean => {
     if (depth === n) {
-      return leafDeviation() === Dstar;
+      return leafDeviation(c0lo, c0hi) === Dstar;
     }
     const mask = usedMask();
     const key = stateKeyBC(depth, last, S, c0lo, c0hi, tLo, tHi);
@@ -754,7 +1193,7 @@ export function solve(
       tLoArr[depth] = mv.tLo;
       tHiArr[depth] = mv.tHi;
       ok = dfsCfeasible(depth + 1, mv.j, S + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi);
-      used[mv.j] =0;
+      used[mv.j] = 0;
       if (ok) break;
     }
     memoC.set(key, ok);
@@ -763,6 +1202,8 @@ export function solve(
 
   const chosen: number[] = [];
   const fixedGaps: number[] = [];
+  /** Forward-tightened timestamp windows of every fixed prefix position. */
+  const fixedWin: { lo: number; hi: number }[] = [];
   let curLast = -1;
   let curS = 0;
   let curC0lo = 0;
@@ -771,20 +1212,14 @@ export function solve(
   let curTHi = 0;
   let curMask = 0;
 
-  /** Reproduce the forward-tightened windows of the fixed prefix so the
-   * oracle's memoization keys and leaf tightening see a consistent state. */
+  /** Restore the fixed prefix into the shared arrays so the oracle's
+   * memoization keys and leaf certification see exactly the frontier state
+   * recorded when each position was fixed. */
   const replayPrefixWindows = (): void => {
     for (let k = 0; k < chosen.length; k++) {
-      const p = packets[chosen[k]];
-      if (k === 0) {
-        tLoArr[0] = p.lo;
-        tHiArr[0] = p.hi;
-      } else {
-        const d = fixedGaps[k - 1];
-        tLoArr[k] = Math.max(p.lo, tLoArr[k - 1] + d * minInterval);
-        tHiArr[k] = Math.min(p.hi, tHiArr[k - 1] + d * maxInterval);
-      }
       orderArr[k] = chosen[k];
+      tLoArr[k] = fixedWin[k].lo;
+      tHiArr[k] = fixedWin[k].hi;
       if (k > 0) gapsArr[k - 1] = fixedGaps[k - 1];
     }
   };
@@ -844,6 +1279,7 @@ export function solve(
       curC0hi = Math.min(seed.topCount, countUpper - n + 1);
       curTLo = seed.lo;
       curTHi = seed.hi;
+      fixedWin.push({ lo: seed.lo, hi: seed.hi });
     } else {
       const mv = picked.mv!;
       fixedGaps.push(mv.d);
@@ -852,26 +1288,20 @@ export function solve(
       curC0hi = mv.c0hi;
       curTLo = mv.tLo;
       curTHi = mv.tHi;
+      fixedWin.push({ lo: mv.tLo, hi: mv.tHi });
     }
     curLast = picked.j;
     curMask |= 1 << picked.j;
   }
 
-  // Assemble the certified solution: smallest admissible c0, optimal times.
+  // Assemble the certified solution: exact first count, composed per-edge
+  // bounds and optimal integer timestamps.
   const finalOrder = chosen.slice();
   const finalGaps = fixedGaps.slice();
-  const windows = tightenWindows(packets, finalOrder, finalGaps, minInterval, maxInterval);
-  if (!windows) {
-    throw new SolveError('NO_CONSISTENT_INTERPRETATION', 'internal failure tightening final windows');
+  const certified = certifyLeaf(finalOrder, finalGaps, curC0lo, curC0hi);
+  if (!certified) {
+    throw new SolveError('NO_CONSISTENT_INTERPRETATION', 'internal failure certifying final interpretation');
   }
-  const { times, deviation2: dev2 } = optimalTimes(
-    packets,
-    finalOrder,
-    windows,
-    finalGaps,
-    minInterval,
-    maxInterval,
-  );
   let gapSum = 0;
   for (const d of finalGaps) gapSum += d;
 
@@ -879,15 +1309,14 @@ export function solve(
     packets,
     {
       gapSum,
-      deviation2: dev2,
-      times,
+      deviation2: certified.deviation2,
+      times: certified.times,
       order: finalOrder,
-      c0: curC0lo,
+      c0: certified.c0,
       gaps: finalGaps,
     },
     modulus,
-    minInterval,
-    maxInterval,
+    beat,
   );
 }
 
@@ -895,8 +1324,7 @@ function buildResult(
   packets: Packet[],
   cand: { gapSum: number; deviation2: number; times: number[]; order: number[]; c0: number; gaps: number[] },
   modulus: number,
-  minInterval: number,
-  maxInterval: number,
+  beat: BeatConfig,
 ): SolveResult {
   const n = cand.order.length;
   const order = cand.order.map((ix) => packets[ix].id);
@@ -923,7 +1351,18 @@ function buildResult(
       }
       const tGap = cand.times[k] - cand.times[k - 1];
       const prevP = packets[cand.order[k - 1]];
-      adjacency.push({
+      // Without a beat switch these are simply d old steps and 0 new ones,
+      // and the added fields are omitted so the legacy response is unchanged.
+      const split = splitSteps(beat, prevCount, d);
+      const oldSteps = split.oldSteps;
+      const newSteps = split.newSteps;
+      const oldMinGap = oldSteps * beat.oldLo;
+      const oldMaxGap = oldSteps * beat.oldHi;
+      const newMinGap = newSteps * beat.newLo;
+      const newMaxGap = newSteps * beat.newHi;
+      const allowedMin = oldMinGap + newMinGap;
+      const allowedMax = oldMaxGap + newMaxGap;
+      const evidence: AdjacencyEvidence = {
         index: k - 1,
         fromId: prevP.id,
         toId: p.id,
@@ -933,7 +1372,7 @@ function buildResult(
         fromTime: cand.times[k - 1],
         toTime: cand.times[k],
         timeGap: tGap,
-        allowedTimeGap: { min: d * minInterval, max: d * maxInterval },
+        allowedTimeGap: { min: allowedMin, max: allowedMax },
         missingBetween: d - 1,
         congruence: { remainder: p.remainder, modulus },
         absoluteCountCongruent: modNonNeg(count, modulus) === p.remainder,
@@ -942,20 +1381,42 @@ function buildResult(
           to: { lower: p.lo, upper: p.hi },
         },
         satisfied:
-          tGap >= d * minInterval &&
-          tGap <= d * maxInterval &&
+          tGap >= allowedMin &&
+          tGap <= allowedMax &&
           cand.times[k - 1] >= prevP.lo &&
           cand.times[k - 1] <= prevP.hi &&
           cand.times[k] >= p.lo &&
           cand.times[k] <= p.hi &&
           modNonNeg(prevCount, modulus) === prevP.remainder &&
           modNonNeg(count, modulus) === p.remainder,
-      });
+      };
+      if (beat.enabled) {
+        evidence.oldSteps = oldSteps;
+        evidence.newSteps = newSteps;
+        evidence.beatBreakdown = {
+          switchAtCount: beat.switchAt,
+          old: {
+            steps: oldSteps,
+            minInterval: beat.oldLo,
+            maxInterval: beat.oldHi,
+            minTimeGap: oldMinGap,
+            maxTimeGap: oldMaxGap,
+          },
+          next: {
+            steps: newSteps,
+            minInterval: beat.newLo,
+            maxInterval: beat.newHi,
+            minTimeGap: newMinGap,
+            maxTimeGap: newMaxGap,
+          },
+        };
+      }
+      adjacency.push(evidence);
     }
     if (k < n - 1) count += cand.gaps[k];
   }
 
-  return {
+  const result: SolveResult = {
     order,
     assignments,
     missingSegments,
@@ -963,16 +1424,190 @@ function buildResult(
     adjacency,
     observedCountRange: { first: cand.c0, last: cand.c0 + cand.gapSum },
   };
+  if (beat.enabled) {
+    result.beatSwitch = {
+      firstNewBeatCount: beat.switchAt,
+      oldMinInterval: beat.oldLo,
+      oldMaxInterval: beat.oldHi,
+      newMinInterval: beat.newLo,
+      newMaxInterval: beat.newHi,
+    };
+  }
+  return result;
 }
+
+/** Beat-aware decomposition detail for one candidate extension gap. */
+function beatBlockerDetail(
+  beat: BeatConfig,
+  d: number,
+  S: number,
+  c0lo: number,
+  c0hi: number,
+  actualTimeGap: { min: number; max: number },
+): BeatBlockerDetail {
+  const sMax = clampInt(beat.switchAt - 1 - S - c0lo, 0, d);
+  const sMin = clampInt(beat.switchAt - 1 - S - c0hi, 0, d);
+  const lAt = (s: number): number => s * beat.oldLo + (d - s) * beat.newLo;
+  const uAt = (s: number): number => s * beat.oldHi + (d - s) * beat.newHi;
+  return {
+    switchAtCount: beat.switchAt,
+    countGap: d,
+    oldBeat: {
+      steps: { min: sMin, max: sMax },
+      minInterval: beat.oldLo,
+      maxInterval: beat.oldHi,
+    },
+    newBeat: {
+      steps: { min: d - sMax, max: d - sMin },
+      minInterval: beat.newLo,
+      maxInterval: beat.newHi,
+    },
+    composedTimeGap: {
+      min: Math.min(lAt(sMin), lAt(sMax)),
+      max: Math.max(uAt(sMin), uAt(sMax)),
+    },
+    actualTimeGap,
+  };
+}
+
+/**
+ * Analyze a complete chain that could not be certified under a beat switch:
+ * find the first edge for which, over the c0 box, every admissible old/new
+ * step split still contradicts the tightened timestamp windows. The
+ * returned evidence carries the absolute-count range of both endpoints and
+ * the beat decomposition, so a beat conflict is distinguishable from a
+ * missing packet. Returns null if no single edge is conclusive.
+ */
+function analyzeBeatLeafConflict(
+  packets: Packet[],
+  dead: DeadState,
+  modulus: number,
+  countLower: number,
+  countUpper: number,
+  beat: BeatConfig,
+): ConstraintFailureEvidence | null {
+  const order = dead.placed;
+  const gaps = dead.gaps;
+  const n = order.length;
+  const partialOrder = order.map((ix) => packets[ix].id);
+  const firstResidue = packets[order[0]].remainder;
+
+  const edgeEvidence = (
+    k: number,
+    Sprefix: number,
+    c0BoxLo: number,
+    c0BoxHi: number,
+    fwdPrev: { lo: number; hi: number },
+  ): ConstraintFailureEvidence => {
+    const d = gaps[k - 1];
+    const p = packets[order[k]];
+    const actual = { min: p.lo - fwdPrev.hi, max: p.hi - fwdPrev.lo };
+    // The caller passes either the full existential c0 box or a single
+    // concrete first count (lo === hi) for an exact witness.
+    const detailBeat = beatBlockerDetail(beat, d, Sprefix, c0BoxLo, c0BoxHi, actual);
+    const fromLo = Sprefix + c0BoxLo;
+    const fromHi = Sprefix + c0BoxHi;
+    const splitKind =
+      detailBeat.oldBeat.steps.max === 0
+        ? 'runs entirely on the new beat'
+        : detailBeat.newBeat.steps.max === 0
+          ? 'runs entirely on the old beat'
+          : 'straddles the beat switch';
+    return {
+      stage: 'extension',
+      partialLength: n,
+      partialOrder,
+      candidateId: p.id,
+      reason:
+        `the full order ${partialOrder.map(String).join(' -> ')} fixes every packet, but the adjacency ` +
+        `${String(packets[order[k - 1]].id)} -> ${String(p.id)} (gap ${d}) ${splitKind} at count ` +
+        `${beat.switchAt}: its old/new step split ranges over ` +
+        `${detailBeat.oldBeat.steps.min}..${detailBeat.oldBeat.steps.max} old + ` +
+        `${detailBeat.newBeat.steps.min}..${detailBeat.newBeat.steps.max} new steps, composing an ` +
+        `allowed time difference of [${detailBeat.composedTimeGap.min}, ${detailBeat.composedTimeGap.max}], ` +
+        `while the tightened closed intervals only admit [${actual.min}, ${actual.max}]. Absolute ` +
+        `counts: last observed packet in [${fromLo}, ${fromHi}], candidate ${String(p.id)} in ` +
+        `[${fromLo + d}, ${fromHi + d}] (search window [${countLower}, ${countUpper}]). This is a ` +
+        `beat-switch conflict, not a missing packet`,
+      detail: {
+        cause: 'TIME_GAP',
+        countGap: d,
+        actualTimeGapRange: actual,
+        absoluteCountRange: {
+          from: { min: fromLo, max: fromHi },
+          to: { min: fromLo + d, max: fromHi + d },
+        },
+        beatBreakdown: detailBeat,
+      },
+    };
+  };
+
+  // Pass 1: cheap existential forward tightening over the whole c0 box.
+  const fwd: { lo: number; hi: number }[] = new Array(n);
+  fwd[0] = { lo: packets[order[0]].lo, hi: packets[order[0]].hi };
+  let Sprefix = 0;
+  for (let k = 1; k < n; k++) {
+    const d = gaps[k - 1];
+    const p = packets[order[k]];
+    const sMax = clampInt(beat.switchAt - 1 - Sprefix - dead.c0lo, 0, d);
+    const sMin = clampInt(beat.switchAt - 1 - Sprefix - dead.c0hi, 0, d);
+    const lAt = (s: number): number => s * beat.oldLo + (d - s) * beat.newLo;
+    const uAt = (s: number): number => s * beat.oldHi + (d - s) * beat.newHi;
+    const lMin = Math.min(lAt(sMin), lAt(sMax));
+    const uMax = Math.max(uAt(sMin), uAt(sMax));
+    const lo = Math.max(p.lo, fwd[k - 1].lo + lMin);
+    const hi = Math.min(p.hi, fwd[k - 1].hi + uMax);
+    if (lo > hi) {
+      return edgeEvidence(k, Sprefix, dead.c0lo, dead.c0hi, fwd[k - 1]);
+    }
+    fwd[k] = { lo, hi };
+    Sprefix += d;
+  }
+
+  // Pass 2: the relaxed box survived, so test concrete congruent first
+  // counts exactly (c0 is pinned to the first packet's residue). The first
+  // failing witness pinpoints the blocking edge and beat split.
+  let totalGap = 0;
+  for (const d of gaps) totalGap += d;
+  for (let c0 = ceilResidue(dead.c0lo, firstResidue, modulus); c0 <= dead.c0hi; c0 += modulus) {
+    if (c0 < countLower || c0 + totalGap > countUpper) continue;
+    const w: { lo: number; hi: number }[] = new Array(n);
+    w[0] = { lo: packets[order[0]].lo, hi: packets[order[0]].hi };
+    let pref = 0;
+    let bad: number | null = null;
+    for (let k = 1; k < n; k++) {
+      const d = gaps[k - 1];
+      const p = packets[order[k]];
+      const split = splitSteps(beat, pref + c0, d);
+      const L = split.oldSteps * beat.oldLo + split.newSteps * beat.newLo;
+      const U = split.oldSteps * beat.oldHi + split.newSteps * beat.newHi;
+      const lo = Math.max(p.lo, w[k - 1].lo + L);
+      const hi = Math.min(p.hi, w[k - 1].hi + U);
+      if (lo > hi) {
+        bad = k;
+        break;
+      }
+      w[k] = { lo, hi };
+      pref += d;
+    }
+    if (bad !== null) {
+      let prefBad = 0;
+      for (let k = 1; k < bad; k++) prefBad += gaps[k - 1];
+      return edgeEvidence(bad, prefBad, c0, c0, w[bad - 1]);
+    }
+  }
+  return null;
+}
+
 
 function buildFailureEvidence(
   packets: Packet[],
-  pair: PairFeas[][],
+  pair: { delta: number; dLo: number; dHi: number }[][],
   bestDead: DeadState | null,
   modulus: number,
+  countLower: number,
   countUpper: number,
-  minInterval: number,
-  maxInterval: number,
+  beat: BeatConfig,
 ): SolveError {
   const make = (evidence: ConstraintFailureEvidence): SolveError =>
     new SolveError(
@@ -987,8 +1622,20 @@ function buildFailureEvidence(
       partialLength: 0,
       partialOrder: [],
       candidateId: packets[0].id,
-      reason: 'no packet can be seeded inside the absolute count search window',
+      reason:
+        'no packet can be seeded inside the absolute count search window' +
+        (beat.enabled ? ` (beat switch at count ${beat.switchAt})` : ''),
     });
+  }
+
+  // A complete order reached the leaf but no concrete first absolute count
+  // certifies it under the beat switch. Analyze the fixed chain exactly: the
+  // first edge whose composed old/new range contradicts the tightened time
+  // windows is the blocking beat-switch conflict (distinct from a genuine
+  // missing packet, which would have failed earlier with a count gap).
+  if (bestDead.depth === packets.length && beat.enabled) {
+    const leaf = analyzeBeatLeafConflict(packets, bestDead, modulus, countLower, countUpper, beat);
+    if (leaf) return make(leaf);
   }
 
   const n = packets.length;
@@ -996,15 +1643,8 @@ function buildFailureEvidence(
   const partialOrder = placed.map((ix) => packets[ix].id);
   const usedNow = new Set(placed);
   const slotsAfter = n - 1 - depth;
+  const cap = countUpper - slotsAfter;
 
-  // Reproduce the canonical successor scan at the deepest dead end. For each
-  // unused successor derive the feasible counter-gap range implied by each
-  // constraint class independently:
-  //   time:  [Tlo, Thi] from the tightened timestamp windows
-  //   count: [Clo, Chi] from the c0 window and remaining absolute slots
-  // plus the intrinsic ceiling pair.dHi (raw pair intervals + search window)
-  // and the congruence residue. Their intersection is empty at a dead end;
-  // the first blocker in canonical order (cause, gap, id) is reported.
   type Blocker = {
     j: number;
     cause: 'TIME_GAP' | 'COUNT_WINDOW' | 'CONGRUENCE';
@@ -1014,15 +1654,9 @@ function buildFailureEvidence(
     countRange: { min: number; max: number };
     intrinsicCeiling: number;
     achievable: { min: number; max: number };
+    c0Box: { lo: number; hi: number };
   };
   const blockers: Blocker[] = [];
-
-  /** Smallest value >= lo congruent to `delta` and <= hi, else Infinity. */
-  const snap = (lo: number, hi: number, delta: number): number => {
-    if (lo > hi) return Infinity;
-    const v = ceilResidue(lo, delta, modulus);
-    return v <= hi ? v : Infinity;
-  };
 
   for (let j = 0; j < n; j++) {
     if (usedNow.has(j)) continue;
@@ -1030,36 +1664,78 @@ function buildFailureEvidence(
     const pf = pair[last][j];
     const d0 = pf.delta === 0 ? modulus : pf.delta;
 
-    const Tlo = Math.ceil((pj.lo - tHi) / maxInterval);
-    const Thi = Math.floor((pj.hi - tLo) / minInterval);
-    const Clo = pj.baseCount - S - c0hi;
-    const Chi = Math.min(pj.topCount - S - c0lo, countUpper - slotsAfter - S - c0lo);
-    const loAll = Math.max(d0, Tlo, Clo);
-    const hiAll = Math.min(pf.dHi, Thi, Chi);
-
+    // Count-window side (identical in both models): congruent gaps whose
+    // endpoints land in the search window and leave room for the rest.
+    const Clo = Math.max(d0, pj.baseCount - S - c0hi);
+    const Chi = Math.min(pf.dHi, pj.topCount - S - c0lo, cap - S - c0lo);
     const snapOrInf = (lo: number, hi: number): number => {
       if (lo > hi) return Infinity;
       const d = ceilResidue(lo, pf.delta, modulus);
       return d <= hi ? d : Infinity;
     };
+    const dCount = snapOrInf(Clo, Chi);
+
+    if (beat.enabled) {
+      // Exact scan mirroring enumerateMoves: test every congruent gap in the
+      // count-admissible range against the narrowed first-count box and the
+      // composed old/new time envelope. A dead end admits none.
+      let feasibleGap = Infinity;
+      let firstCountGap = Infinity;
+      if (dCount !== Infinity) {
+        firstCountGap = dCount;
+        for (let d = dCount; d <= Chi; d += modulus) {
+          const njLo = Math.max(c0lo, pj.baseCount - S - d);
+          const njHi = Math.min(c0hi, pj.topCount - S - d, cap - S - d);
+          if (njLo > njHi) continue;
+          const sMax = clampInt(beat.switchAt - 1 - S - njLo, 0, d);
+          const sMin = clampInt(beat.switchAt - 1 - S - njHi, 0, d);
+          const lAt = (s: number): number => s * beat.oldLo + (d - s) * beat.newLo;
+          const uAt = (s: number): number => s * beat.oldHi + (d - s) * beat.newHi;
+          const lMin = Math.min(lAt(sMin), lAt(sMax));
+          const uMax = Math.max(uAt(sMin), uAt(sMax));
+          const ntLo = Math.max(pj.lo, tLo + lMin);
+          const ntHi = Math.min(pj.hi, tHi + uMax);
+          if (ntLo <= ntHi) {
+            feasibleGap = d;
+            break;
+          }
+        }
+      }
+      if (feasibleGap !== Infinity) continue; // genuinely extendable
+      blockers.push({
+        j,
+        cause: dCount !== Infinity ? 'TIME_GAP' : Clo > Chi ? 'COUNT_WINDOW' : 'CONGRUENCE',
+        dStar: firstCountGap,
+        delta: pf.delta,
+        timeRange: { min: Math.ceil((pj.lo - tHi) / Math.max(beat.oldHi, beat.newHi)), max: Math.floor((pj.hi - tLo) / Math.min(beat.oldLo, beat.newLo)) },
+        countRange: { min: Clo, max: Chi },
+        intrinsicCeiling: pf.dHi,
+        achievable: { min: pj.lo - tHi, max: pj.hi - tLo },
+        c0Box: { lo: c0lo, hi: c0hi },
+      });
+      continue;
+    }
+
+    // Single-beat model: exact scalar gap ranges from the tightened boxes.
+    const Tlo = Math.ceil((pj.lo - tHi) / beat.oldHi);
+    const Thi = Math.floor((pj.hi - tLo) / beat.oldLo);
     const dTime = snapOrInf(Math.max(d0, Tlo), Thi);
-    const dCount = snapOrInf(Math.max(d0, Clo), Chi);
+    const loAll = Math.max(d0, Tlo, Clo);
+    const hiAll = Math.min(pf.dHi, Thi, Chi);
     const dBoth = snapOrInf(loAll, hiAll);
 
     let cause: Blocker['cause'];
     let dStar: number;
     if (dBoth !== Infinity) continue; // extendable; cannot occur at a dead end
     if (dCount !== Infinity) {
-      // The smallest gap satisfying congruence + the count window exists;
-      // the extension attempt at it fails on the time-difference range.
+      // Smallest congruent gap satisfying the count window exists; the
+      // extension fails on the time-difference range.
       cause = 'TIME_GAP';
       dStar = dCount;
     } else if (dTime !== Infinity) {
-      // Timing admits a congruent gap but the absolute-count window does not.
       cause = 'COUNT_WINDOW';
       dStar = dTime;
     } else {
-      // Neither range alone contains a congruent value.
       cause = Tlo > Thi ? 'TIME_GAP' : 'CONGRUENCE';
       dStar = Infinity;
     }
@@ -1073,6 +1749,7 @@ function buildFailureEvidence(
       countRange: { min: Clo, max: Chi },
       intrinsicCeiling: pf.dHi,
       achievable: { min: pj.lo - tHi, max: pj.hi - tLo },
+      c0Box: { lo: c0lo, hi: c0hi },
     });
   }
 
@@ -1090,38 +1767,143 @@ function buildFailureEvidence(
     const prevId = String(packets[last].id);
     const finite = (x: number): number => (Number.isFinite(x) ? x : -1);
     const d = b.dStar;
+    const achievable = b.achievable;
 
-    if (b.cause === 'TIME_GAP') {
-      // Smallest congruent gap that would satisfy the time-difference range.
-      const firstPositive = b.delta === 0 ? modulus : b.delta;
-      const dTiming = snap(Math.max(firstPositive, b.timeRange.min), b.timeRange.max, b.delta);
-      const dCountVal = b.dStar;
+    // Representative extension gap for count ranges / beat decomposition:
+    // prefer the smallest congruent gap the count window admits.
+    const repD = Number.isFinite(d)
+      ? d
+      : (() => {
+          const lo = Math.max(1, b.countRange.min);
+          const dd = ceilResidue(lo, b.delta, modulus);
+          return dd <= Math.max(b.countRange.max, lo - 1) ? dd : Math.max(1, lo);
+        })();
+    const repA = Math.max(b.c0Box.lo, pj.baseCount - S - repD);
+    const repB = Math.min(b.c0Box.hi, pj.topCount - S - repD, cap - S - repD);
+    const absRange = {
+      from: { min: S + Math.max(b.c0Box.lo, repA), max: S + Math.min(b.c0Box.hi, repB) },
+      to: {
+        min: S + repD + Math.max(b.c0Box.lo, repA),
+        max: S + repD + Math.min(b.c0Box.hi, repB),
+      },
+    };
+
+    if (!beat.enabled) {
+      if (b.cause === 'TIME_GAP') {
+        const firstPositive = b.delta === 0 ? modulus : b.delta;
+        const dTiming = (() => {
+          const lo = Math.max(firstPositive, b.timeRange.min);
+          if (lo > b.timeRange.max) return Infinity;
+          const v = ceilResidue(lo, b.delta, modulus);
+          return v <= b.timeRange.max ? v : Infinity;
+        })();
+        const dCountVal = b.dStar;
+        return make({
+          stage: 'extension',
+          partialLength: depth,
+          partialOrder,
+          candidateId: pj.id,
+          reason:
+            `cannot append packet ${String(pj.id)} after packet ${prevId}: the time-difference ` +
+            `constraint needs a counter gap in [${b.timeRange.min}, ${b.timeRange.max}] but the ` +
+            `absolute-count window only permits [${b.countRange.min}, ${b.countRange.max}] ` +
+            `(smallest congruent gap satisfying the count window: ${finite(dCountVal)}; satisfying ` +
+            `the time range: ${finite(dTiming)}). The tightened closed intervals only admit time ` +
+            `differences in [${achievable.min}, ${achievable.max}], so no single gap satisfies ` +
+            `both constraints`,
+          detail: {
+            cause: 'TIME_GAP',
+            minimalCongruentGap: Number.isFinite(dCountVal) ? dCountVal : undefined,
+            countGap: Number.isFinite(dCountVal) ? dCountVal : undefined,
+            requiredTimeGap: Number.isFinite(dTiming)
+              ? { min: dTiming * beat.oldLo, max: dTiming * beat.oldHi }
+              : undefined,
+            actualTimeGapRange: achievable,
+            countGapWindow: { min: b.countRange.min, max: b.countRange.max },
+          },
+        });
+      }
+
+      if (b.cause === 'COUNT_WINDOW') {
+        return make({
+          stage: 'extension',
+          partialLength: depth,
+          partialOrder,
+          candidateId: pj.id,
+          reason:
+            `cannot append packet ${String(pj.id)} after packet ${prevId}: the absolute-count ` +
+            `window only admits a counter gap in [${b.countRange.min}, ${b.countRange.max}] (intrinsic ` +
+            `ceiling ${b.intrinsicCeiling}), but the time-difference constraint needs a gap in ` +
+            `[${b.timeRange.min}, ${b.timeRange.max}]; the two ranges have no congruent value in common`,
+          detail: {
+            cause: 'COUNT_WINDOW',
+            minimalCongruentGap: Number.isFinite(d) ? d : undefined,
+            countGapWindow: { min: b.countRange.min, max: b.countRange.max },
+            requiredTimeGap: Number.isFinite(d)
+              ? { min: d * beat.oldLo, max: d * beat.oldHi }
+              : undefined,
+            actualTimeGapRange: achievable,
+          },
+        });
+      }
+
       return make({
         stage: 'extension',
         partialLength: depth,
         partialOrder,
         candidateId: pj.id,
         reason:
-          `cannot append packet ${String(pj.id)} after packet ${prevId}: the time-difference ` +
-          `constraint needs a counter gap in [${b.timeRange.min}, ${b.timeRange.max}] but the ` +
-          `absolute-count window only permits [${b.countRange.min}, ${b.countRange.max}] ` +
-          `(smallest congruent gap satisfying the count window: ${finite(dCountVal)}; satisfying ` +
-          `the time range: ${finite(dTiming)}). The tightened closed intervals only admit time ` +
-          `differences in [${b.achievable.min}, ${b.achievable.max}], so no single gap satisfies ` +
-          `both constraints`,
+          `cannot append packet ${String(pj.id)} after packet ${prevId}: the time-feasible gap range ` +
+          `[${b.timeRange.min}, ${b.timeRange.max}] and count-feasible gap range ` +
+          `[${b.countRange.min}, ${b.countRange.max}] overlap but contain no positive counter gap ` +
+          `congruent to ${pair[last][b.j].delta} modulo ${modulus}`,
         detail: {
-          cause: 'TIME_GAP',
-          minimalCongruentGap: Number.isFinite(dCountVal) ? dCountVal : undefined,
-          countGap: Number.isFinite(dCountVal) ? dCountVal : undefined,
-          requiredTimeGap: Number.isFinite(dTiming)
-            ? { min: dTiming * minInterval, max: dTiming * maxInterval }
-            : undefined,
-          actualTimeGapRange: b.achievable,
+          cause: 'CONGRUENCE',
+          minimalCongruentGap: Number.isFinite(d) ? d : undefined,
           countGapWindow: { min: b.countRange.min, max: b.countRange.max },
+          actualTimeGapRange: achievable,
         },
       });
     }
 
+    // Beat-switch evidence: always carry the absolute-count range and the
+    // old/new beat decomposition so engineers can tell a genuine missing
+    // packet apart from a beat-switch conflict.
+    const detailBeat = beatBlockerDetail(beat, repD, S, b.c0Box.lo, b.c0Box.hi, achievable);
+    const composed = detailBeat.composedTimeGap;
+    const beatNote =
+      `beat switch at count ${beat.switchAt}: old interval ` +
+      `[${beat.oldLo}, ${beat.oldHi}], new interval [${beat.newLo}, ${beat.newHi}]; for gap ${repD} ` +
+      `the old/new step split ranges over ${detailBeat.oldBeat.steps.min}..${detailBeat.oldBeat.steps.max} ` +
+      `old + ${detailBeat.newBeat.steps.min}..${detailBeat.newBeat.steps.max} new steps, composing an ` +
+      `allowed time difference of [${composed.min}, ${composed.max}] while the closed intervals only ` +
+      `admit [${achievable.min}, ${achievable.max}]`;
+    const countNote =
+      `absolute counts: last observed packet in [${absRange.from.min}, ${absRange.from.max}], ` +
+      `candidate ${String(pj.id)} would be in [${absRange.to.min}, ${absRange.to.max}] ` +
+      `(search window [${countLower}, ${countUpper}])`;
+
+    if (b.cause === 'TIME_GAP') {
+      return make({
+        stage: 'extension',
+        partialLength: depth,
+        partialOrder,
+        candidateId: pj.id,
+        reason:
+          `cannot append packet ${String(pj.id)} after packet ${prevId}: no old/new beat step split ` +
+          `satisfies the timing. ${beatNote}; ${countNote}. This is a beat-switch timing conflict ` +
+          `rather than a missing-packet gap`,
+        detail: {
+          cause: 'TIME_GAP',
+          minimalCongruentGap: Number.isFinite(b.dStar) ? b.dStar : undefined,
+          countGap: repD,
+          actualTimeGapRange: achievable,
+          countGapWindow: { min: b.countRange.min, max: b.countRange.max },
+          absoluteCountRange: absRange,
+          beatBreakdown: detailBeat,
+        },
+      });
+    }
     if (b.cause === 'COUNT_WINDOW') {
       return make({
         stage: 'extension',
@@ -1129,37 +1911,38 @@ function buildFailureEvidence(
         partialOrder,
         candidateId: pj.id,
         reason:
-          `cannot append packet ${String(pj.id)} after packet ${prevId}: the absolute-count ` +
-          `window only admits a counter gap in [${b.countRange.min}, ${b.countRange.max}] (intrinsic ` +
-          `ceiling ${b.intrinsicCeiling}), but the time-difference constraint needs a gap in ` +
-          `[${b.timeRange.min}, ${b.timeRange.max}]; the two ranges have no congruent value in common`,
+          `cannot append packet ${String(pj.id)} after packet ${prevId}: the absolute-count window ` +
+          `only permits a counter gap in [${b.countRange.min}, ${b.countRange.max}] (intrinsic ceiling ` +
+          `${b.intrinsicCeiling}); ${beatNote}; ${countNote}`,
         detail: {
           cause: 'COUNT_WINDOW',
-          minimalCongruentGap: Number.isFinite(d) ? d : undefined,
+          minimalCongruentGap: Number.isFinite(b.dStar) ? b.dStar : undefined,
+          countGap: repD,
+          actualTimeGapRange: achievable,
           countGapWindow: { min: b.countRange.min, max: b.countRange.max },
-          requiredTimeGap: Number.isFinite(d)
-            ? { min: d * minInterval, max: d * maxInterval }
-            : undefined,
-          actualTimeGapRange: b.achievable,
+          absoluteCountRange: absRange,
+          beatBreakdown: detailBeat,
         },
       });
     }
-
     return make({
       stage: 'extension',
       partialLength: depth,
       partialOrder,
       candidateId: pj.id,
       reason:
-        `cannot append packet ${String(pj.id)} after packet ${prevId}: the time-feasible gap range ` +
-        `[${b.timeRange.min}, ${b.timeRange.max}] and count-feasible gap range ` +
-        `[${b.countRange.min}, ${b.countRange.max}] overlap but contain no positive counter gap ` +
-        `congruent to ${pair[last][b.j].delta} modulo ${modulus}`,
+        `cannot append packet ${String(pj.id)} after packet ${prevId}: no positive counter gap ` +
+        `congruent to ${b.delta} modulo ${modulus} lies in both the time-feasible range ` +
+        `[${b.timeRange.min}, ${b.timeRange.max}] and the count-feasible range ` +
+        `[${b.countRange.min}, ${b.countRange.max}]; ${beatNote}; ${countNote}`,
       detail: {
         cause: 'CONGRUENCE',
-        minimalCongruentGap: Number.isFinite(d) ? d : undefined,
+        minimalCongruentGap: Number.isFinite(b.dStar) ? b.dStar : undefined,
+        countGap: repD,
+        actualTimeGapRange: achievable,
         countGapWindow: { min: b.countRange.min, max: b.countRange.max },
-        actualTimeGapRange: b.achievable,
+        absoluteCountRange: absRange,
+        beatBreakdown: detailBeat,
       },
     });
   }
@@ -1170,6 +1953,8 @@ function buildFailureEvidence(
     partialLength: depth,
     partialOrder,
     candidateId: candidate.id,
-    reason: `cannot extend from packet ${String(candidate.id)}: no unused packet remains`,
+    reason:
+      `cannot extend from packet ${String(candidate.id)}: no unused packet remains` +
+      (beat.enabled ? ` (beat switch at count ${beat.switchAt})` : ''),
   });
 }

@@ -77,4 +77,48 @@ describe('validateRequest', () => {
     b.countUpper = b.countLower + 2_000_000;
     expect(() => validateRequest(b)).toThrow(SolveError);
   });
+
+  describe('beatSwitch', () => {
+    const withBeat = (beat: unknown) => ({ ...valid(), beatSwitch: beat });
+
+    it('accepts a well-formed beat switch', () => {
+      const r = validateRequest(withBeat({ firstNewBeatCount: 20, newMinInterval: 19, newMaxInterval: 21 }));
+      expect(r.beatSwitch).toEqual({ firstNewBeatCount: 20, newMinInterval: 19, newMaxInterval: 21 });
+    });
+
+    it('leaves beatSwitch undefined when omitted (backwards compatible)', () => {
+      expect(validateRequest(valid()).beatSwitch).toBeUndefined();
+    });
+
+    it.each([
+      ['not an object', []],
+      ['null is treated as absent', null],
+    ])('handles beatSwitch %s', (label, value) => {
+      if (label === 'null is treated as absent') {
+        expect(validateRequest(withBeat(value)).beatSwitch).toBeUndefined();
+      } else {
+        expect(() => validateRequest(withBeat(value))).toThrow(SolveError);
+      }
+    });
+
+    it.each([
+      ['non-integer first count', { firstNewBeatCount: 2.5, newMinInterval: 1, newMaxInterval: 2 }],
+      ['missing new bounds', { firstNewBeatCount: 20 }],
+      ['zero new minimum', { firstNewBeatCount: 20, newMinInterval: 0, newMaxInterval: 2 }],
+      ['inverted new interval', { firstNewBeatCount: 20, newMinInterval: 9, newMaxInterval: 3 }],
+    ])('rejects %s with INVALID_REQUEST', (_label, beat) => {
+      try {
+        validateRequest(withBeat(beat));
+        throw new Error('should have thrown');
+      } catch (e) {
+        expect((e as SolveError).code).toBe('INVALID_REQUEST');
+      }
+    });
+
+    it('rejects a new interval exceeding the precision guard', () => {
+      expect(() =>
+        validateRequest(withBeat({ firstNewBeatCount: 20, newMinInterval: 1, newMaxInterval: 2_000_000 })),
+      ).toThrow(SolveError);
+    });
+  });
 });

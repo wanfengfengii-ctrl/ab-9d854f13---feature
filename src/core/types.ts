@@ -27,6 +27,22 @@ export interface PacketInput {
   timeUpper: number;
 }
 
+export interface BeatSwitchInput {
+  /**
+   * First absolute counter that belongs to the NEW beat. The step c -> c+1
+   * uses the old interval when c+1 <= firstNewBeatCount (i.e. the step ends
+   * before the switch), otherwise the new interval. Adjacent observed packets
+   * that straddle this counter accumulate allowed time difference over the
+   * old-step and new-step counts separately; no single beat may be applied to
+   * the whole gap.
+   */
+  firstNewBeatCount: number;
+  /** New sampling interval lower bound (inclusive), positive integer. */
+  newMinInterval: number;
+  /** New sampling interval upper bound (inclusive). */
+  newMaxInterval: number;
+}
+
 export interface SolveRequest {
   packets: PacketInput[];
   /** Counter modulus M (rotation period), integer >= 2. */
@@ -35,10 +51,16 @@ export interface SolveRequest {
   countLower: number;
   /** Inclusive absolute-counter search window upper bound. */
   countUpper: number;
-  /** Minimum interval (inclusive) between adjacent samples. */
+  /** Minimum interval (inclusive) between adjacent samples (the OLD beat). */
   minInterval: number;
-  /** Maximum interval (inclusive) between adjacent samples. */
+  /** Maximum interval (inclusive) between adjacent samples (the OLD beat). */
   maxInterval: number;
+  /**
+   * Optional in-voyage sampling-beat switch. When omitted the request, the
+   * three-level adjudication and the response stay exactly compatible with
+   * the single-beat model.
+   */
+  beatSwitch?: BeatSwitchInput;
 }
 
 /** Per-adjacent-pair constraint check evidence. */
@@ -51,12 +73,34 @@ export interface AdjacencyEvidence {
   toCount: number;
   /** toCount - fromCount (always >= 1; observed packets are distinct). */
   countGap: number;
+  /**
+   * Steps of the gap governed by the OLD beat. Present only when a beat
+   * switch was submitted. Equal to countGap when the pair lies entirely
+   * before the switch.
+   */
+  oldSteps?: number;
+  /**
+   * Steps of the gap governed by the NEW beat (countGap - oldSteps).
+   * Present only when a beat switch was submitted.
+   */
+  newSteps?: number;
   fromTime: number;
   toTime: number;
   /** toTime - fromTime (always positive for a consistent solution). */
   timeGap: number;
-  /** Inclusive feasible time-difference range for this counter gap. */
+  /**
+   * Inclusive feasible time-difference range for this gap. With a beat switch
+   * this is the COMPOSED range: oldSteps old-beat steps plus newSteps new-beat
+   * steps are summed, so a straddling pair never gets a single beat applied
+   * to the whole gap.
+   */
   allowedTimeGap: { min: number; max: number };
+  /** Per-beat decomposition backing allowedTimeGap (present with a switch). */
+  beatBreakdown?: {
+    switchAtCount: number;
+    old: { steps: number; minInterval: number; maxInterval: number; minTimeGap: number; maxTimeGap: number };
+    next: { steps: number; minInterval: number; maxInterval: number; minTimeGap: number; maxTimeGap: number };
+  };
   /** Number of unobserved absolute counters strictly between the pair. */
   missingBetween: number;
   /** Congruence note for the destination packet. */
@@ -99,6 +143,14 @@ export interface SolveResult {
   adjacency: AdjacencyEvidence[];
   /** Counts of the first/last observed packets. */
   observedCountRange: { first: number; last: number };
+  /** Echoed only when the request enabled a sampling-beat switch. */
+  beatSwitch?: {
+    firstNewBeatCount: number;
+    oldMinInterval: number;
+    oldMaxInterval: number;
+    newMinInterval: number;
+    newMaxInterval: number;
+  };
 }
 
 /** Stable business error codes. */
@@ -135,7 +187,46 @@ export interface ConstraintFailureEvidence {
     actualTimeGapRange?: { min: number; max: number };
     /** Residual gap range allowed by the absolute-count search window. */
     countGapWindow?: { min: number; max: number };
+    /**
+     * Destination absolute-count range implied by the rejected extension,
+     * letting engineers distinguish a genuine missing packet from a beat
+     * switch conflict.
+     */
+    absoluteCountRange?: {
+      from: { min: number; max: number };
+      to: { min: number; max: number };
+    };
+    /**
+     * Old/new beat decomposition of the rejected counter gap. The composed
+     * time-difference range is the SUM of the per-beat step ranges; a gap
+     * straddling the switch is never judged under a single beat.
+     */
+    beatBreakdown?: BeatBlockerDetail;
   };
+}
+
+/** Per-beat decomposition attached to a first-blocking evidence entry. */
+export interface BeatBlockerDetail {
+  /** First absolute counter governed by the new beat. */
+  switchAtCount: number;
+  /** Counter gap under examination. */
+  countGap: number;
+  oldBeat: {
+    /** Range of old-beat step counts compatible with the gap and switch. */
+    steps: { min: number; max: number };
+    minInterval: number;
+    maxInterval: number;
+  };
+  newBeat: {
+    /** Range of new-beat step counts compatible with the gap and switch. */
+    steps: { min: number; max: number };
+    minInterval: number;
+    maxInterval: number;
+  };
+  /** Summed (composed) allowed time-difference range over both beats. */
+  composedTimeGap: { min: number; max: number };
+  /** Timestamp difference actually attainable from the closed intervals. */
+  actualTimeGap: { min: number; max: number };
 }
 
 export class SolveError extends Error {

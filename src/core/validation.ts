@@ -1,4 +1,4 @@
-import type { PacketInput, SolveRequest } from './types.js';
+import type { BeatSwitchInput, PacketInput, SolveRequest } from './types.js';
 import { SolveError } from './types.js';
 
 /**
@@ -46,10 +46,55 @@ export function validateRequest(raw: unknown): SolveRequest {
       'maxInterval must not exceed 1,000,000 to keep gap products integral',
     );
   }
+
+  // Optional in-voyage sampling-beat switch. Omitted => fully compatible with
+  // the single-beat request/response contract.
+  let beatSwitch: BeatSwitchInput | undefined;
+  if (obj.beatSwitch !== undefined && obj.beatSwitch !== null) {
+    if (typeof obj.beatSwitch !== 'object' || Array.isArray(obj.beatSwitch)) {
+      throw new SolveError('INVALID_REQUEST', 'field "beatSwitch" must be an object');
+    }
+    const bs = obj.beatSwitch as Record<string, unknown>;
+    if (
+      !isSafeInt(bs.firstNewBeatCount) ||
+      !isSafeInt(bs.newMinInterval) ||
+      !isSafeInt(bs.newMaxInterval)
+    ) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'beatSwitch fields firstNewBeatCount/newMinInterval/newMaxInterval must be safe integers',
+      );
+    }
+    if (bs.newMinInterval <= 0) {
+      throw new SolveError('INVALID_REQUEST', 'beatSwitch.newMinInterval must be a positive integer');
+    }
+    if (bs.newMaxInterval < bs.newMinInterval) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'beatSwitch.newMaxInterval must be >= beatSwitch.newMinInterval',
+      );
+    }
+    if (bs.newMaxInterval > 1_000_000) {
+      throw new SolveError(
+        'INVALID_REQUEST',
+        'beatSwitch.newMaxInterval must not exceed 1,000,000 to keep gap products integral',
+      );
+    }
+    beatSwitch = {
+      firstNewBeatCount: bs.firstNewBeatCount,
+      newMinInterval: bs.newMinInterval,
+      newMaxInterval: bs.newMaxInterval,
+    };
+  }
+
   // Guard against silent precision loss when multiplying the window width
-  // by the largest interval, and against time coordinates that cannot be
-  // combined exactly with gap products.
-  if ((countUpper - countLower) * maxInterval > 1e13) {
+  // by the largest interval (either beat), and against time coordinates that
+  // cannot be combined exactly with gap products.
+  const effectiveMaxInterval = Math.max(
+    maxInterval,
+    beatSwitch ? beatSwitch.newMaxInterval : maxInterval,
+  );
+  if ((countUpper - countLower) * effectiveMaxInterval > 1e13) {
     throw new SolveError(
       'INVALID_REQUEST',
       '(countUpper - countLower) * maxInterval must not exceed 1e13',
@@ -127,5 +172,5 @@ export function validateRequest(raw: unknown): SolveRequest {
     return { id: po.id as string | number, remainder, timeLower, timeUpper };
   });
 
-  return { packets, modulus, countLower, countUpper, minInterval, maxInterval };
+  return { packets, modulus, countLower, countUpper, minInterval, maxInterval, beatSwitch };
 }

@@ -1,9 +1,36 @@
-import type { PacketInput } from '../../src/core/types.js';
+import type { BeatSwitchInput, PacketInput } from '../../src/core/types.js';
 
 export interface RefSolution {
   missing: number;
   deviation: number;
   idSeq: (string | number)[];
+}
+
+export interface BeatSpec {
+  switchAt: number;
+  newMinInterval: number;
+  newMaxInterval: number;
+}
+
+export function beatSpecFrom(input?: BeatSwitchInput): BeatSpec | null {
+  if (!input) return null;
+  return {
+    switchAt: input.firstNewBeatCount,
+    newMinInterval: input.newMinInterval,
+    newMaxInterval: input.newMaxInterval,
+  };
+}
+
+/** Old/new step split of the edge starting at absolute count a. */
+export function refSplit(
+  beat: BeatSpec | null,
+  a: number,
+  d: number,
+): { oldSteps: number; newSteps: number } {
+  if (!beat) return { oldSteps: d, newSteps: 0 };
+  const o = beat.switchAt - 1 - a;
+  const oldSteps = o <= 0 ? 0 : o >= d ? d : o;
+  return { oldSteps, newSteps: d - oldSteps };
 }
 
 export function lexIds(a: (string | number)[], b: (string | number)[]): number {
@@ -25,6 +52,10 @@ export function lexIds(a: (string | number)[], b: (string | number)[]): number {
  * assignment, then every integer timestamp in each closed interval, with
  * adjacency bounds pruned inline. Returns the lexicographically optimal
  * (missing, deviation, id sequence) tuple or null when nothing is feasible.
+ *
+ * With a beat switch the admissible time difference of each edge is the
+ * composition of its old-beat and new-beat steps (never a single beat over
+ * the whole gap).
  */
 export function bruteSolve(
   packets: PacketInput[],
@@ -33,6 +64,7 @@ export function bruteSolve(
   countUpper: number,
   minInterval: number,
   maxInterval: number,
+  beat: BeatSpec | null = null,
 ): RefSolution | null {
   const n = packets.length;
   const mod = (a: number): number => ((a % modulus) + modulus) % modulus;
@@ -74,7 +106,10 @@ export function bruteSolve(
       if (k > 0) {
         const d = counts[k] - counts[k - 1];
         const g = t - times[k - 1];
-        if (g < d * minInterval || g > d * maxInterval) continue;
+        const s = refSplit(beat, counts[k - 1], d);
+        const lo = s.oldSteps * minInterval + s.newSteps * (beat ? beat.newMinInterval : minInterval);
+        const hi = s.oldSteps * maxInterval + s.newSteps * (beat ? beat.newMaxInterval : maxInterval);
+        if (g < lo || g > hi) continue;
       }
       times[k] = t;
       if (k === n - 1) considerLeaf();
@@ -95,8 +130,12 @@ export function bruteSolve(
       if (c + (n - 1 - k) > countUpper) break;
       if (k > 0) {
         const d = c - counts[k - 1];
-        if (p.timeLower - packets[order[k - 1]].timeUpper > d * maxInterval) continue;
-        if (p.timeUpper - packets[order[k - 1]].timeLower < d * minInterval) continue;
+        const pp = packets[order[k - 1]];
+        const s = refSplit(beat, counts[k - 1], d);
+        const lo = s.oldSteps * minInterval + s.newSteps * (beat ? beat.newMinInterval : minInterval);
+        const hi = s.oldSteps * maxInterval + s.newSteps * (beat ? beat.newMaxInterval : maxInterval);
+        if (p.timeLower - pp.timeUpper > hi) continue;
+        if (p.timeUpper - pp.timeLower < lo) continue;
       }
       counts[k] = c;
       chooseCount(k + 1);
